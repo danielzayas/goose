@@ -554,8 +554,16 @@ impl Session {
                     save_history(&mut editor);
 
                     let prompt = "Are you sure you want to summarize this conversation? This will condense the message history.";
-                    let should_summarize =
-                        cliclack::confirm(prompt).initial_value(true).interact()?;
+                    let should_summarize = match cliclack::confirm(prompt).initial_value(true).interact() {
+                        Ok(choice) => choice,
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                false // Convert Ctrl+C/ESC to "No"
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    };
 
                     if should_summarize {
                         println!("{}", console::style("Summarizing conversation...").yellow());
