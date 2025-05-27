@@ -558,7 +558,7 @@ impl Session {
                         Ok(choice) => choice,
                         Err(e) => {
                             if e.kind() == std::io::ErrorKind::Interrupted {
-                                false // Convert Ctrl+C/ESC to "No"
+                                false // If interrupted, set should_summarize to false
                             } else {
                                 return Err(e.into());
                             }
@@ -632,10 +632,18 @@ impl Session {
         match planner_response_type {
             PlannerResponseType::Plan => {
                 println!();
-                let should_act =
-                    cliclack::confirm("Do you want to clear message history & act on this plan?")
-                        .initial_value(true)
-                        .interact()?;
+                let should_act = match cliclack::confirm("Do you want to clear message history & act on this plan?")
+                    .initial_value(true)
+                    .interact() {
+                    Ok(choice) => choice,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            false // If interrupted, set should_act to false
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                };
                 if should_act {
                     output::render_act_on_plan();
                     self.run_mode = RunMode::Normal;
