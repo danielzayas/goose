@@ -554,16 +554,17 @@ impl Session {
                     save_history(&mut editor);
 
                     let prompt = "Are you sure you want to summarize this conversation? This will condense the message history.";
-                    let should_summarize = match cliclack::confirm(prompt).initial_value(true).interact() {
-                        Ok(choice) => choice,
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::Interrupted {
-                                false // If interrupted, set should_summarize to false
-                            } else {
-                                return Err(e.into());
+                    let should_summarize =
+                        match cliclack::confirm(prompt).initial_value(true).interact() {
+                            Ok(choice) => choice,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::Interrupted {
+                                    false // If interrupted, set should_summarize to false
+                                } else {
+                                    return Err(e.into());
+                                }
                             }
-                        }
-                    };
+                        };
 
                     if should_summarize {
                         println!("{}", console::style("Summarizing conversation...").yellow());
@@ -632,9 +633,12 @@ impl Session {
         match planner_response_type {
             PlannerResponseType::Plan => {
                 println!();
-                let should_act = match cliclack::confirm("Do you want to clear message history & act on this plan?")
-                    .initial_value(true)
-                    .interact() {
+                let should_act = match cliclack::confirm(
+                    "Do you want to clear message history & act on this plan?",
+                )
+                .initial_value(true)
+                .interact()
+                {
                     Ok(choice) => choice,
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::Interrupted {
