@@ -766,11 +766,23 @@ impl Session {
                                 if interactive {
                                     // In interactive mode, ask the user what to do
                                     let prompt = "The model's context length is maxed out. You will need to reduce the # msgs. Do you want to?".to_string();
-                                    let selected = cliclack::select(prompt)
+                                    let selected_result = cliclack::select(prompt)
                                         .item("clear", "Clear Session", "Removes all messages from Goose's memory")
                                         .item("truncate", "Truncate Messages", "Removes old messages till context is within limits")
                                         .item("summarize", "Summarize Session", "Summarize the session to reduce context length")
-                                        .interact()?;
+                                        .item("cancel", "Cancel", "Cancel and return to chat")
+                                        .interact();
+
+                                    let selected = match selected_result {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                                "cancel" // If interrupted, set selected to cancel
+                                            } else {
+                                                return Err(e.into());
+                                            }
+                                        }
+                                    };
 
                                     match selected {
                                         "clear" => {
@@ -790,6 +802,9 @@ impl Session {
                                         "summarize" => {
                                             // Use the helper function to summarize context
                                             Self::summarize_context_messages(&mut self.messages, &self.agent, "Goose summarized messages for you.").await?;
+                                        }
+                                        "cancel" => {
+                                            break; // Return to main prompt
                                         }
                                         _ => {
                                             unreachable!()
