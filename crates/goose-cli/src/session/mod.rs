@@ -708,6 +708,7 @@ impl Session {
                     id: session_id.clone(),
                     working_dir: std::env::current_dir()
                         .expect("failed to get current session working directory"),
+                    schedule_id: None,
                 }),
             )
             .await?;
@@ -828,6 +829,7 @@ impl Session {
                                             id: session_id.clone(),
                                             working_dir: std::env::current_dir()
                                                 .expect("failed to get current session working directory"),
+                                            schedule_id: None,
                                         }),
                                     )
                                     .await?;
