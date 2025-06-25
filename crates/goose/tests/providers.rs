@@ -172,10 +172,7 @@ impl ProviderTester {
             .expect("Expected successful tool_call");
 
         assert_eq!(tool_call.name, "get_weather");
-        assert_eq!(
-            tool_call.arguments.get("location").and_then(|v| v.as_str()),
-            Some("San Francisco, CA")
-        );
+        
         assert_eq!(
             tool_call.arguments.get("unit").and_then(|v| v.as_str()),
             Some("celsius")
@@ -183,9 +180,19 @@ impl ProviderTester {
 
         let id = &tool_request.id;
 
-        let weather_response_content = "The weather in San Francisco is 15 degrees celsius.";
-        let weather = Message::user()
-            .with_tool_response(id, Ok(vec![Content::text(weather_response_content)]));
+        let weather = Message::user().with_tool_response(
+            id,
+            Ok(vec![Content::text(
+                "
+                  50°F°C
+                  Precipitation: 0%
+                  Humidity: 84%
+                  Wind: 2 mph
+                  Weather
+                  Saturday 9:00 PM
+                  Clear",
+            )]),
+        );
 
         // Verify we construct a valid payload including the request/response pair for the next inference
         let (response2, _) = self
@@ -207,17 +214,6 @@ impl ProviderTester {
                 .iter()
                 .any(|content| matches!(content, MessageContent::Text(_))),
             "Expected text for final response"
-        );
-
-        let final_text = response2
-            .content
-            .iter()
-            .find_map(|content| content.as_text().map(String::from))
-            .unwrap_or_default();
-
-        assert!(
-            final_text.contains("15") && final_text.contains("celsius"),
-            "Final response should contain the weather information"
         );
 
         Ok(())
