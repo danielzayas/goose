@@ -1,17 +1,52 @@
 name: Sync Upstream Issues
 
 on:
-  # Allow manual runs from the Actions tab
   workflow_dispatch: {}
-  
-  # Run hourly to automatically sync changes
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 * * * *"   # hourly
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sync-upstream-issues
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate required secrets exist
+        run: |
+          missing=""
+          [ -z "${{ secrets.READ_GOOSE_UPSTREAM_PAT }}" ] && missing="${missing} READ_GOOSE_UPSTREAM_PAT"
+          [ -z "${{ secrets.WRITE_GOOSE_FORK_PAT }}" ] && missing="${missing} WRITE_GOOSE_FORK_PAT"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required repo secret(s):$missing"
+            echo "Add them in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Probe upstream access with READ_GOOSE_UPSTREAM_PAT
+        env:
+          TOKEN: ${{ secrets.READ_GOOSE_UPSTREAM_PAT }}
+        run: |
+          # Check repo visibility/access
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $TOKEN" \
+            https://api.github.com/repos/block/goose)
+          if [ "$code" != "200" ]; then
+            echo "::error::Upstream repo not accessible with READ_GOOSE_UPSTREAM_PAT (HTTP $code)."
+            echo "Ensure the token owner has access to block/goose and the token has at least Issues: Read (fine-grained) or repo scope (classic)."
+            exit 1
+          fi
+          # Optional: check rate limit (confirms we're authenticated)
+          limit=$(curl -s -H "Authorization: token $TOKEN" https://api.github.com/rate_limit | jq -r '.resources.core.limit')
+          if [ -z "$limit" ] || [ "$limit" -le 60 ]; then
+            echo "::warning::READ_GOOSE_UPSTREAM_PAT appears unauthenticated or low quota (core.limit=$limit)."
+          fi
+
       - name: Sync issues from block/goose → danielzayas/goose
         uses: Maximisch/issue-sync-action@main
         with:
@@ -19,7 +54,6 @@ jobs:
           target_repo: "danielzayas/goose"
           source_pat: ${{ secrets.READ_GOOSE_UPSTREAM_PAT }}
           target_pat: ${{ secrets.WRITE_GOOSE_FORK_PAT }}
-          # The following are default values but are kept for clarity
-          only_sync_main_issue: "false" 
+          only_sync_main_issue: "false"
           source_url: "api.github.com"
           target_url: "api.github.com"
