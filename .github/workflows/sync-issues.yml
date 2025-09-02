@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Sync issues from block/goose → danielzayas/goose
-        uses: Maximisch/issue-sync-action@v2
+        uses: Maximisch/issue-sync-action@main
         with:
           source_repo: "block/goose"
           target_repo: "danielzayas/goose"
