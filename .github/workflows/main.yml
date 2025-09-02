@@ -1,0 +1,25 @@
+name: Sync Upstream Issues
+
+on:
+  # Allow manual runs from the Actions tab
+  workflow_dispatch: {}
+  
+  # Run hourly to automatically sync changes
+  schedule:
+    - cron: "17 * * * *"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync issues from block/goose → danielzayas/goose
+        uses: Maximisch/issue-sync-action@v2
+        with:
+          source_repo: "block/goose"
+          target_repo: "danielzayas/goose"
+          source_pat: ${{ secrets.READ_GOOSE_UPSTREAM_PAT }}
+          target_pat: ${{ secrets.WRITE_GOOSE_FORK_PAT }}
+          # The following are default values but are kept for clarity
+          only_sync_main_issue: "false" 
+          source_url: "api.github.com"
+          target_url: "api.github.com"
