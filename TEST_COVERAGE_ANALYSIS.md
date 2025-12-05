@@ -61,34 +61,43 @@ This document provides an analysis of test coverage for the Goose project, speci
 
 **File: `crates/goose/tests/providers.rs`**
 
-This file contains integration tests that make **REAL API calls** to language model providers. These tests:
+This file contains integration tests that make **REAL API calls** to language model providers. The key component is:
 
-- Check for required environment variables (API keys) and skip if not present
-- Make actual network requests to providers like:
-  - OpenAI (`test_openai_provider`)
-  - Anthropic (`test_anthropic_provider`)
-  - Azure (`test_azure_provider`)
-  - Bedrock (`test_bedrock_provider`)
-  - Databricks (`test_databricks_provider`)
-  - Google (`test_google_provider`)
-  - Groq (`test_groq_provider`)
-  - OpenRouter (`test_openrouter_provider`)
-  - Ollama (`test_ollama_provider`)
-  - Snowflake (`test_snowflake_provider`)
-  - Xai (`test_xai_provider`)
-  - LiteLLM (`test_litellm_provider`)
-  - SageMaker TGI (`test_sagemaker_tgi_provider`)
+**`ProviderTester` (lines 81-360)**: A generic test harness that:
+- Takes any real `Provider` implementation (not a mock)
+- Calls `self.provider.complete()` which makes real API calls through the provider
+- Runs a comprehensive test suite:
+  - `test_basic_response()` - Makes real API calls for basic text responses
+  - `test_tool_usage()` - Makes real API calls with tool definitions
+  - `test_context_length_exceeded_error()` - Tests context window limits
+  - `test_image_content_support()` - Tests image input handling
 
-- Test scenarios include:
-  - Basic text responses
-  - Tool usage
-  - Context length exceeded errors
-  - Image content support
+**`test_provider()` function (lines 369-448)**: Creates real provider instances:
+- Takes provider factory functions like `openai::OpenAiProvider::default`
+- Creates actual provider instances (not mocks)
+- Passes them to `ProviderTester` which then makes real API calls
+
+**Individual test functions (lines 450-625)** that test each provider:
+- `test_openai_provider()` - Uses real `OpenAiProvider`
+- `test_anthropic_provider()` - Uses real `AnthropicProvider`
+- `test_azure_provider()` - Uses real `AzureProvider`
+- `test_bedrock_provider()` - Uses real `BedrockProvider`
+- `test_databricks_provider()` - Uses real `DatabricksProvider`
+- `test_google_provider()` - Uses real `GoogleProvider`
+- `test_groq_provider()` - Uses real `GroqProvider`
+- `test_openrouter_provider()` - Uses real `OpenRouterProvider`
+- `test_ollama_provider()` - Uses real `OllamaProvider`
+- `test_snowflake_provider()` - Uses real `SnowflakeProvider`
+- `test_xai_provider()` - Uses real `XaiProvider`
+- `test_litellm_provider()` - Uses real `LiteLLMProvider`
+- `test_sagemaker_tgi_provider()` - Uses real `SageMakerTgiProvider`
 
 **Key Evidence:**
-- Lines 94-116: `test_basic_response()` calls `provider.complete()` which makes real API calls
-- Lines 118-203: `test_tool_usage()` makes real API calls with tool definitions
-- Lines 450-625: Individual test functions for each provider that require API keys
+- Line 87: `ProviderTester::new()` takes a real `Provider` implementation
+- Line 99: `self.provider.complete()` makes real API calls
+- Line 420: `let provider = provider_fn()` creates real provider instances
+- Line 436: Real providers are passed to `ProviderTester::new()`
+- Lines 456, 551, etc.: Provider factory functions create real implementations (e.g., `openai::OpenAiProvider::default`)
 
 ---
 
