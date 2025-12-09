@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::errors::ProviderError;
 use super::retry::RetryConfig;
+use crate::config::base::ConfigValue;
 use crate::conversation::message::Message;
 use crate::conversation::Conversation;
 use crate::model::ModelConfig;
@@ -30,6 +31,8 @@ pub fn set_current_model(model: &str) {
 pub fn get_current_model() -> Option<String> {
     CURRENT_MODEL.lock().ok().and_then(|model| model.clone())
 }
+
+pub static MSG_COUNT_FOR_SESSION_NAME_GENERATION: usize = 3;
 
 /// Information about a model's capabilities
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -79,6 +82,14 @@ impl ModelInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum ProviderType {
+    Preferred,
+    Builtin,
+    Declarative,
+    Custom,
+}
+
 /// Metadata about a provider's configuration requirements and capabilities
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderMetadata {
@@ -91,7 +102,6 @@ pub struct ProviderMetadata {
     /// The default/recommended model for this provider
     pub default_model: String,
     /// A list of currently known models with their capabilities
-    /// TODO: eventually query the apis directly
     pub known_models: Vec<ModelInfo>,
     /// Link to the docs where models can be found
     pub model_doc_link: String,
@@ -130,7 +140,6 @@ impl ProviderMetadata {
         }
     }
 
-    /// Create a new ProviderMetadata with ModelInfo objects that include cost data
     pub fn with_models(
         name: &str,
         display_name: &str,
@@ -188,6 +197,16 @@ impl ConfigKey {
             required,
             secret,
             default: default.map(|s| s.to_string()),
+            oauth_flow: false,
+        }
+    }
+
+    pub fn from_value_type<T: ConfigValue>(required: bool, secret: bool) -> Self {
+        Self {
+            name: T::KEY.to_string(),
+            required,
+            secret,
+            default: Some(T::DEFAULT.to_string()),
             oauth_flow: false,
         }
     }
@@ -270,11 +289,11 @@ impl Add for Usage {
     type Output = Self;
 
     fn add(self, other: Self) -> Self {
-        Self {
-            input_tokens: sum_optionals(self.input_tokens, other.input_tokens),
-            output_tokens: sum_optionals(self.output_tokens, other.output_tokens),
-            total_tokens: sum_optionals(self.total_tokens, other.total_tokens),
-        }
+        Self::new(
+            sum_optionals(self.input_tokens, other.input_tokens),
+            sum_optionals(self.output_tokens, other.output_tokens),
+            sum_optionals(self.total_tokens, other.total_tokens),
+        )
     }
 }
 
@@ -290,10 +309,21 @@ impl Usage {
         output_tokens: Option<i32>,
         total_tokens: Option<i32>,
     ) -> Self {
+        let calculated_total = if total_tokens.is_none() {
+            match (input_tokens, output_tokens) {
+                (Some(input), Some(output)) => Some(input + output),
+                (Some(input), None) => Some(input),
+                (None, Some(output)) => Some(output),
+                (None, None) => None,
+            }
+        } else {
+            total_tokens
+        };
+
         Self {
             input_tokens,
             output_tokens,
-            total_tokens,
+            total_tokens: calculated_total,
         }
     }
 }
@@ -316,6 +346,9 @@ pub trait Provider: Send + Sync {
     fn metadata() -> ProviderMetadata
     where
         Self: Sized;
+
+    /// Get the name of this provider instance
+    fn get_name(&self) -> &str;
 
     // Internal implementation of complete, used by complete_fast and complete
     // Providers should override this to implement their actual completion logic
@@ -378,18 +411,15 @@ pub trait Provider: Send + Sync {
         RetryConfig::default()
     }
 
-    /// Optional hook to fetch supported models.
     async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
         Ok(None)
     }
 
-    /// Check if this provider supports embeddings
     fn supports_embeddings(&self) -> bool {
         false
     }
 
-    /// Check if this provider supports cache control
-    fn supports_cache_control(&self) -> bool {
+    async fn supports_cache_control(&self) -> bool {
         false
     }
 
@@ -437,7 +467,7 @@ pub trait Provider: Send + Sync {
         messages
             .iter()
             .filter(|m| m.role == rmcp::model::Role::User)
-            .take(3)
+            .take(MSG_COUNT_FOR_SESSION_NAME_GENERATION)
             .map(|m| m.as_concat_text())
             .collect()
     }
@@ -459,7 +489,12 @@ pub trait Provider: Send + Sync {
             )
             .await?;
 
-        let description = result.0.as_concat_text();
+        let description = result
+            .0
+            .as_concat_text()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
 
         Ok(safe_truncate(&description, 100))
     }
@@ -552,17 +587,17 @@ mod tests {
         assert_eq!(model, Some("gpt-4o".to_string()));
 
         // Change the model
-        set_current_model("claude-3.5-sonnet");
+        set_current_model("claude-sonnet-4-20250514");
 
         // Get the updated model and verify
         let model = get_current_model();
-        assert_eq!(model, Some("claude-3.5-sonnet".to_string()));
+        assert_eq!(model, Some("claude-sonnet-4-20250514".to_string()));
     }
 
     #[test]
     fn test_provider_metadata_context_limits() {
         // Test that ProviderMetadata::new correctly sets context limits
-        let test_models = vec!["gpt-4o", "claude-3-5-sonnet-latest", "unknown-model"];
+        let test_models = vec!["gpt-4o", "claude-sonnet-4-20250514", "unknown-model"];
         let metadata = ProviderMetadata::new(
             "test",
             "Test Provider",
@@ -582,9 +617,9 @@ mod tests {
         // gpt-4o should have 128k limit
         assert_eq!(*model_info.get("gpt-4o").unwrap(), 128_000);
 
-        // claude-3-5-sonnet-latest should have 200k limit
+        // claude-sonnet-4-20250514 should have 200k limit
         assert_eq!(
-            *model_info.get("claude-3-5-sonnet-latest").unwrap(),
+            *model_info.get("claude-sonnet-4-20250514").unwrap(),
             200_000
         );
 

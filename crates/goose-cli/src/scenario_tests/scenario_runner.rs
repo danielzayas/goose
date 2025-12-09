@@ -4,13 +4,15 @@ use goose::conversation::Conversation;
 use crate::scenario_tests::message_generator::MessageGenerator;
 use crate::scenario_tests::mock_client::weather_client;
 use crate::scenario_tests::provider_configs::{get_provider_configs, ProviderConfig};
-use crate::session::Session;
+use crate::session::CliSession;
 use anyhow::Result;
 use goose::agents::Agent;
 use goose::model::ModelConfig;
 use goose::providers::{create, testprovider::TestProvider};
+use goose::session::session_manager::SessionType;
+use goose::session::SessionManager;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -139,6 +141,8 @@ where
     use goose::config::ExtensionConfig;
     use tokio::sync::Mutex;
 
+    goose::agents::moim::SKIP.with(|f| f.set(true));
+
     if let Ok(path) = dotenv() {
         println!("Loaded environment from {:?}", path);
     }
@@ -180,7 +184,7 @@ where
 
         let original_env = setup_environment(config)?;
 
-        let inner_provider = create(&factory_name, ModelConfig::new(&config.model_name)?)?;
+        let inner_provider = create(&factory_name, ModelConfig::new(config.model_name)?).await?;
 
         let test_provider = Arc::new(TestProvider::new_recording(inner_provider, &file_path));
         (
@@ -190,7 +194,6 @@ where
         )
     };
 
-    // Generate messages using the provider
     let messages = vec![message_generator(&*provider_arc)];
 
     let mock_client = weather_client();
@@ -203,7 +206,7 @@ where
             ExtensionConfig::Builtin {
                 name: "".to_string(),
                 display_name: None,
-                description: None,
+                description: "".to_string(),
                 timeout: None,
                 bundled: None,
                 available_tools: vec![],
@@ -214,15 +217,35 @@ where
         )
         .await;
 
+    let session = SessionManager::create_session(
+        PathBuf::default(),
+        "scenario-runner".to_string(),
+        SessionType::Hidden,
+    )
+    .await?;
+
     agent
-        .update_provider(provider_arc as Arc<dyn goose::providers::base::Provider>)
+        .update_provider(
+            provider_arc as Arc<dyn goose::providers::base::Provider>,
+            &session.id,
+        )
         .await?;
 
-    let mut session = Session::new(agent, None, false, None, None, None, None);
+    let mut cli_session = CliSession::new(
+        agent,
+        session.id,
+        false,
+        None,
+        None,
+        None,
+        None,
+        "text".to_string(),
+    )
+    .await;
 
     let mut error = None;
     for message in &messages {
-        if let Err(e) = session
+        if let Err(e) = cli_session
             .process_message(message.clone(), CancellationToken::default())
             .await
         {
@@ -230,7 +253,7 @@ where
             break;
         }
     }
-    let updated_messages = session.message_history();
+    let updated_messages = cli_session.message_history();
 
     if let Some(ref err_msg) = error {
         if err_msg.contains("No recorded response found") {
@@ -249,7 +272,7 @@ where
 
     validator(&result)?;
 
-    drop(session);
+    drop(cli_session);
 
     if let Some(provider) = provider_for_saving {
         if result.error.is_none() {

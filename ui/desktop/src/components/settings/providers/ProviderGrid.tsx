@@ -1,12 +1,17 @@
 import React, { memo, useMemo, useCallback, useState } from 'react';
 import { ProviderCard } from './subcomponents/ProviderCard';
 import CardContainer from './subcomponents/CardContainer';
-import { ProviderModalProvider, useProviderModal } from './modal/ProviderModalProvider';
 import ProviderConfigurationModal from './modal/ProviderConfiguationModal';
-import { ProviderDetails, CreateCustomProviderRequest } from '../../../api';
+import {
+  DeclarativeProviderConfig,
+  ProviderDetails,
+  UpdateCustomProviderRequest,
+} from '../../../api';
 import { Plus } from 'lucide-react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../ui/dialog';
 import CustomProviderForm from './modal/subcomponents/forms/CustomProviderForm';
+import { SwitchModelModal } from '../models/subcomponents/SwitchModelModal';
+import type { View } from '../../../utils/navigationUtils';
 
 const GridLayout = memo(function GridLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -43,84 +48,144 @@ const CustomProviderCard = memo(function CustomProviderCard({ onClick }: { onCli
   );
 });
 
-// Memoize the ProviderCards component
-const ProviderCards = memo(function ProviderCards({
+function ProviderCards({
   providers,
   isOnboarding,
   refreshProviders,
-  onProviderLaunch,
+  setView,
+  onModelSelected,
 }: {
   providers: ProviderDetails[];
   isOnboarding: boolean;
   refreshProviders?: () => void;
-  onProviderLaunch: (provider: ProviderDetails) => void;
+  setView?: (view: View) => void;
+  onModelSelected?: () => void;
 }) {
-  const { openModal } = useProviderModal();
+  const [configuringProvider, setConfiguringProvider] = useState<ProviderDetails | null>(null);
   const [showCustomProviderModal, setShowCustomProviderModal] = useState(false);
+  const [showSwitchModelModal, setShowSwitchModelModal] = useState(false);
+  const [switchModelProvider, setSwitchModelProvider] = useState<string | null>(null);
+  const [editingProvider, setEditingProvider] = useState<{
+    id: string;
+    config: DeclarativeProviderConfig;
+    isEditable: boolean;
+  } | null>(null);
 
-  // Memoize these functions so they don't get recreated on every render
+  const handleProviderLaunchWithModelSelection = useCallback((provider: ProviderDetails) => {
+    setSwitchModelProvider(provider.name);
+    setShowSwitchModelModal(true);
+  }, []);
+
+  const openModal = useCallback(
+    (provider: ProviderDetails) => setConfiguringProvider(provider),
+    []
+  );
+
   const configureProviderViaModal = useCallback(
-    (provider: ProviderDetails) => {
-      openModal(provider, {
-        onSubmit: () => {
-          // Only refresh if the function is provided
-          if (refreshProviders) {
-            refreshProviders();
-          }
-        },
-        onDelete: (_values: unknown) => {
-          if (refreshProviders) {
-            refreshProviders();
-          }
-        },
-        formProps: {},
-      });
-    },
-    [openModal, refreshProviders]
-  );
+    async (provider: ProviderDetails) => {
+      if (provider.provider_type === 'Custom' || provider.provider_type === 'Declarative') {
+        const { getCustomProvider } = await import('../../../api');
+        const result = await getCustomProvider({ path: { id: provider.name }, throwOnError: true });
 
-  const deleteProviderConfigViaModal = useCallback(
-    (provider: ProviderDetails) => {
-      openModal(provider, {
-        onDelete: (_values: unknown) => {
-          // Only refresh if the function is provided
-          if (refreshProviders) {
-            refreshProviders();
-          }
-        },
-        formProps: {},
-      });
-    },
-    [openModal, refreshProviders]
-  );
-
-  const handleCreateCustomProvider = useCallback(
-    async (data: CreateCustomProviderRequest) => {
-      try {
-        const { createCustomProvider } = await import('../../../api');
-        await createCustomProvider({ body: data });
-        setShowCustomProviderModal(false);
-        if (refreshProviders) {
-          refreshProviders();
+        if (result.data) {
+          setEditingProvider({
+            id: provider.name,
+            config: result.data.config,
+            isEditable: result.data.is_editable,
+          });
+          setShowCustomProviderModal(true);
         }
-      } catch (error) {
-        console.error('Failed to create custom provider:', error);
+      } else {
+        openModal(provider);
       }
+    },
+    [openModal]
+  );
+
+  const handleUpdateCustomProvider = useCallback(
+    async (data: UpdateCustomProviderRequest) => {
+      if (!editingProvider) return;
+
+      const { updateCustomProvider } = await import('../../../api');
+      await updateCustomProvider({
+        path: { id: editingProvider.id },
+        body: data,
+        throwOnError: true,
+      });
+      const providerId = editingProvider.id;
+      setShowCustomProviderModal(false);
+      setEditingProvider(null);
+      if (refreshProviders) {
+        refreshProviders();
+      }
+      setSwitchModelProvider(providerId);
+      setShowSwitchModelModal(true);
+    },
+    [editingProvider, refreshProviders]
+  );
+
+  const handleCloseModal = useCallback(() => {
+    setShowCustomProviderModal(false);
+    setEditingProvider(null);
+  }, []);
+
+  const onCloseProviderConfig = useCallback(() => {
+    setConfiguringProvider(null);
+    if (refreshProviders) {
+      refreshProviders();
+    }
+  }, [refreshProviders]);
+
+  const onProviderConfigured = useCallback(
+    (provider: ProviderDetails) => {
+      setConfiguringProvider(null);
+      if (refreshProviders) {
+        refreshProviders();
+      }
+      setSwitchModelProvider(provider.name);
+      setShowSwitchModelModal(true);
     },
     [refreshProviders]
   );
 
-  // Use useMemo to memoize the cards array
+  const onCloseSwitchModelModal = useCallback(() => {
+    setShowSwitchModelModal(false);
+  }, []);
+
+  const handleSetView = useCallback(
+    (view: View) => {
+      setShowSwitchModelModal(false);
+      if (setView) {
+        setView(view);
+      }
+    },
+    [setView]
+  );
+
+  const handleCreateCustomProvider = useCallback(
+    async (data: UpdateCustomProviderRequest) => {
+      const { createCustomProvider } = await import('../../../api');
+      await createCustomProvider({ body: data, throwOnError: true });
+      setShowCustomProviderModal(false);
+      if (refreshProviders) {
+        refreshProviders();
+      }
+      setShowSwitchModelModal(true);
+    },
+    [refreshProviders]
+  );
+
   const providerCards = useMemo(() => {
     // providers needs to be an array
     const providersArray = Array.isArray(providers) ? providers : [];
-    const cards = providersArray.map((provider) => (
+    // Sort providers alphabetically by name
+    const sortedProviders = [...providersArray].sort((a, b) => a.name.localeCompare(b.name));
+    const cards = sortedProviders.map((provider) => (
       <ProviderCard
         key={provider.name}
         provider={provider}
         onConfigure={() => configureProviderViaModal(provider)}
-        onDelete={() => deleteProviderConfigViaModal(provider)}
-        onLaunch={() => onProviderLaunch(provider)}
+        onLaunch={() => handleProviderLaunchWithModelSelection(provider)}
         isOnboarding={isOnboarding}
       />
     ));
@@ -130,58 +195,78 @@ const ProviderCards = memo(function ProviderCards({
     );
 
     return cards;
-  }, [
-    providers,
-    isOnboarding,
-    configureProviderViaModal,
-    deleteProviderConfigViaModal,
-    onProviderLaunch,
-  ]);
+  }, [providers, isOnboarding, configureProviderViaModal, handleProviderLaunchWithModelSelection]);
 
+  const initialData = editingProvider && {
+    engine: editingProvider.config.engine.toLowerCase() + '_compatible',
+    display_name: editingProvider.config.display_name,
+    api_url: editingProvider.config.base_url,
+    api_key: '',
+    models: editingProvider.config.models.map((m) => m.name),
+    supports_streaming: editingProvider.config.supports_streaming ?? true,
+  };
+
+  const editable = editingProvider ? editingProvider.isEditable : true;
+  const title = (editingProvider ? (editable ? 'Edit' : 'Configure') : 'Add') + '  Provider';
   return (
     <>
       {providerCards}
-
-      <Dialog open={showCustomProviderModal} onOpenChange={setShowCustomProviderModal}>
+      <Dialog open={showCustomProviderModal} onOpenChange={handleCloseModal}>
         <DialogContent className="sm:max-w-[600px]">
           <DialogHeader>
-            <DialogTitle>Add Custom Provider</DialogTitle>
+            <DialogTitle>{title}</DialogTitle>
           </DialogHeader>
           <CustomProviderForm
-            onSubmit={handleCreateCustomProvider}
-            onCancel={() => setShowCustomProviderModal(false)}
+            initialData={initialData}
+            isEditable={editable}
+            onSubmit={editingProvider ? handleUpdateCustomProvider : handleCreateCustomProvider}
+            onCancel={handleCloseModal}
           />
         </DialogContent>
-      </Dialog>
+      </Dialog>{' '}
+      {configuringProvider && (
+        <ProviderConfigurationModal
+          provider={configuringProvider}
+          onClose={onCloseProviderConfig}
+          onConfigured={onProviderConfigured}
+        />
+      )}
+      {showSwitchModelModal && (
+        <SwitchModelModal
+          sessionId={null}
+          onClose={onCloseSwitchModelModal}
+          setView={handleSetView}
+          onModelSelected={onModelSelected}
+          initialProvider={switchModelProvider}
+          titleOverride="Choose Model"
+        />
+      )}
     </>
   );
-});
+}
 
-export default memo(function ProviderGrid({
+export default function ProviderGrid({
   providers,
   isOnboarding,
   refreshProviders,
-  onProviderLaunch,
+  setView,
+  onModelSelected,
 }: {
   providers: ProviderDetails[];
   isOnboarding: boolean;
   refreshProviders?: () => void;
-  onProviderLaunch?: (provider: ProviderDetails) => void;
+  setView?: (view: View) => void;
+  onModelSelected?: () => void;
 }) {
-  // Memoize the modal provider and its children to avoid recreating on every render
-  const modalProviderContent = useMemo(
-    () => (
-      <ProviderModalProvider>
-        <ProviderCards
-          providers={providers}
-          isOnboarding={isOnboarding}
-          refreshProviders={refreshProviders}
-          onProviderLaunch={onProviderLaunch || (() => {})}
-        />
-        <ProviderConfigurationModal />
-      </ProviderModalProvider>
-    ),
-    [providers, isOnboarding, refreshProviders, onProviderLaunch]
+  return (
+    <GridLayout>
+      <ProviderCards
+        providers={providers}
+        isOnboarding={isOnboarding}
+        refreshProviders={refreshProviders}
+        setView={setView}
+        onModelSelected={onModelSelected}
+      />
+    </GridLayout>
   );
-  return <GridLayout>{modalProviderContent}</GridLayout>;
-});
+}

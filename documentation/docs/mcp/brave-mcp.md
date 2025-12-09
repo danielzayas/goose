@@ -1,6 +1,7 @@
 ---
 title: Brave Search Extension
-description: Add Brave Search API as a Goose Extension
+description: Add Brave Search API as a goose Extension
+unlisted: true
 ---
 
 import Tabs from '@theme/Tabs';
@@ -10,14 +11,16 @@ import GooseDesktopInstaller from '@site/src/components/GooseDesktopInstaller';
 
 <YouTubeShortEmbed videoUrl="https://www.youtube.com/embed/kD2YA61NTLU" />
 
-This tutorial will get you started with the [Brave Search MCP Server](https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search) as a Goose extension to enable interactive searches for both web and local searches.
+Server moved
+
+This tutorial will get you started with the [Brave Search MCP Server](https://www.pulsemcp.com/servers/brave-search) as a goose extension to enable interactive searches for both web and local searches.
 
 :::tip TLDR
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   [Launch the installer](goose://extension?cmd=npx&arg=-y&arg=%40modelcontextprotocol%2Fserver-brave-search&id=brave-search&name=Brave%20Search&description=Brave%20Search%20API&env=BRAVE_API_KEY%3DYour%20API%20Key)
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   **Command**
   ```sh
   npx -y @modelcontextprotocol/server-brave-search
@@ -37,7 +40,7 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
 :::
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   <GooseDesktopInstaller
     extensionId="brave-search"
     extensionName="Brave Search"
@@ -49,7 +52,7 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
     apiKeyLinkText="Brave Search API Key"
   />
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   1. Run the `configure` command:
   ```sh
   goose configure
@@ -109,7 +112,7 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
     └ 
   ```  
 
-  5. Enter the number of seconds Goose should wait for actions to complete before timing out. Default is 300s
+  5. Enter the number of seconds goose should wait for actions to complete before timing out. Default is 300s
    ```sh
     ┌   goose-configure 
     │
@@ -215,13 +218,13 @@ The Brave Search MCP server gives you access to the Brave Search API, providing 
 - **Smart Fallbacks**: Local search automatically falls back to web when no results are found
 
 
-#### Goose Prompt
+#### goose Prompt
 
 ```
 ( O)> Organize a Italian dinner party with Ian, Rizel, Ace, and Ebony. Find 3 or 4 YouTube cooking channels (with URLs) that focus on Italian cuisine for beginners, and then find one recipe (with URL) for each person to make: one salad, two entrees, and one dessert.
 ```
 
-#### Goose Output
+#### goose Output
 
 ```
 

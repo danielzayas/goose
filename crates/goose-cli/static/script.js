@@ -121,7 +121,7 @@ function addThinkingIndicator() {
             <span></span>
             <span></span>
         </div>
-        <span class="thinking-text">Goose is thinking...</span>
+        <span class="thinking-text">goose is thinking...</span>
     `;
     messagesContainer.appendChild(thinkingDiv);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -138,7 +138,8 @@ function removeThinkingIndicator() {
 // Connect to WebSocket
 function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const token = window.GOOSE_WS_TOKEN || '';
+    const wsUrl = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
     
     socket = new WebSocket(wsUrl);
     
@@ -473,11 +474,10 @@ async function loadSessionIfExists() {
                 resumeDiv.className = 'message system-message';
                 resumeDiv.innerHTML = `<em>Session resumed: ${sessionData.messages.length} messages loaded</em>`;
                 messagesContainer.appendChild(resumeDiv);
-                
-                
+                                
                 // Update page title with session description if available
                 if (sessionData.metadata && sessionData.metadata.description) {
-                    document.title = `Goose Chat - ${sessionData.metadata.description}`;
+                    document.title = `goose chat - ${sessionData.metadata.description}`;
                 }
                 
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -509,14 +509,32 @@ messageInput.addEventListener('input', () => {
 // Initialize WebSocket connection
 connectWebSocket();
 
+// Read 'q' parameter from URL and set it to the message input
+function getQueryParam() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const queryParam = urlParams.get('q');
+    if (queryParam) {
+        messageInput.value = queryParam;
+        urlParams.delete('q');
+        
+        let newUrl = window.location.pathname;
+        if (urlParams.toString()) {
+            newUrl = `${window.location.pathname}?${urlParams.toString()}`;
+        }
+        window.history.replaceState({}, '', newUrl);
+    }
+}
+
+getQueryParam();
+
 // Focus on input
 messageInput.focus();
 
 // Update session title
 function updateSessionTitle() {
     const titleElement = document.getElementById('session-title');
-    // Just show "Goose Chat" - no need to show session ID
-    titleElement.textContent = 'Goose Chat';
+    // Just show "goose chat" - no need to show session ID
+    titleElement.textContent = 'goose chat';
 }
 
 // Update title on load

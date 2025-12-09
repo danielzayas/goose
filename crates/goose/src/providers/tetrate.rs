@@ -1,18 +1,26 @@
 use anyhow::Result;
+use async_stream::try_stream;
 use async_trait::async_trait;
-use serde_json::Value;
+use futures::TryStreamExt;
+use serde_json::{json, Value};
+use std::io;
+use tokio::pin;
+use tokio_stream::StreamExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
 
 use super::api_client::{ApiClient, AuthMethod};
-use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
+use super::base::{ConfigKey, MessageStream, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
+use super::formats::openai::response_to_streaming_message;
 use super::retry::ProviderRetry;
 use super::utils::{
-    emit_debug_trace, get_model, handle_response_google_compat, handle_response_openai_compat,
-    is_google_model,
+    get_model, handle_response_google_compat, handle_response_openai_compat,
+    handle_status_openai_compat, is_google_model, RequestLog,
 };
 use crate::config::signup_tetrate::TETRATE_DEFAULT_MODEL;
 use crate::conversation::message::Message;
-use crate::impl_provider_default;
+
 use crate::model::ModelConfig;
 use crate::providers::formats::openai::{create_request, get_usage, response_to_message};
 use rmcp::model::Tool;
@@ -21,8 +29,7 @@ use rmcp::model::Tool;
 pub const TETRATE_KNOWN_MODELS: &[&str] = &[
     "claude-opus-4-1",
     "claude-3-7-sonnet-latest",
-    "claude-3-5-sonnet-latest",
-    "claude-3-5-haiku-latest",
+    "claude-sonnet-4-20250514",
     "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
@@ -38,12 +45,13 @@ pub struct TetrateProvider {
     #[serde(skip)]
     api_client: ApiClient,
     model: ModelConfig,
+    supports_streaming: bool,
+    #[serde(skip)]
+    name: String,
 }
 
-impl_provider_default!(TetrateProvider);
-
 impl TetrateProvider {
-    pub fn from_env(model: ModelConfig) -> Result<Self> {
+    pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
         let api_key: String = config.get_secret("TETRATE_API_KEY")?;
         // API host for LLM endpoints (/v1/chat/completions, /v1/models)
@@ -54,9 +62,14 @@ impl TetrateProvider {
         let auth = AuthMethod::BearerToken(api_key);
         let api_client = ApiClient::new(host, auth)?
             .with_header("HTTP-Referer", "https://block.github.io/goose")?
-            .with_header("X-Title", "Goose")?;
+            .with_header("X-Title", "goose")?;
 
-        Ok(Self { api_client, model })
+        Ok(Self {
+            api_client,
+            model,
+            supports_streaming: true,
+            name: Self::metadata().name,
+        })
     }
 
     async fn post(&self, payload: &Value) -> Result<Value, ProviderError> {
@@ -102,7 +115,12 @@ impl TetrateProvider {
             // Return appropriate error based on the error code
             match error_code {
                 401 | 403 => return Err(ProviderError::Authentication(error_message.to_string())),
-                429 => return Err(ProviderError::RateLimitExceeded(error_message.to_string())),
+                429 => {
+                    return Err(ProviderError::RateLimitExceeded {
+                        details: error_message.to_string(),
+                        retry_delay: None,
+                    })
+                }
                 500 | 503 => return Err(ProviderError::ServerError(error_message.to_string())),
                 _ => return Err(ProviderError::RequestFailed(error_message.to_string())),
             }
@@ -135,6 +153,10 @@ impl Provider for TetrateProvider {
         )
     }
 
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+
     fn get_model_config(&self) -> ModelConfig {
         self.model.clone()
     }
@@ -150,7 +172,6 @@ impl Provider for TetrateProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
-        // Create the base payload using the provided model_config
         let payload = create_request(
             model_config,
             system,
@@ -158,6 +179,7 @@ impl Provider for TetrateProvider {
             tools,
             &super::utils::ImageFormat::OpenAi,
         )?;
+        let mut log = RequestLog::start(model_config, &payload)?;
 
         // Make request
         let response = self
@@ -174,8 +196,51 @@ impl Provider for TetrateProvider {
             Usage::default()
         });
         let model = get_model(&response);
-        emit_debug_trace(model_config, &payload, &response, &usage);
+        log.write(&response, Some(&usage))?;
         Ok((message, ProviderUsage::new(model, usage)))
+    }
+
+    async fn stream(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        let mut payload = create_request(
+            &self.model,
+            system,
+            messages,
+            tools,
+            &super::utils::ImageFormat::OpenAi,
+        )?;
+
+        payload["stream"] = json!(true);
+        payload["stream_options"] = json!({
+            "include_usage": true,
+        });
+
+        let resp = self
+            .api_client
+            .response_post("v1/chat/completions", &payload)
+            .await?;
+
+        let response = handle_status_openai_compat(resp).await?;
+
+        let stream = response.bytes_stream().map_err(io::Error::other);
+        let mut log = RequestLog::start(&self.model, &payload)?;
+
+        Ok(Box::pin(try_stream! {
+            let stream_reader = StreamReader::new(stream);
+            let framed = FramedRead::new(stream_reader, LinesCodec::new()).map_err(anyhow::Error::from);
+
+            let message_stream = response_to_streaming_message(framed);
+            pin!(message_stream);
+            while let Some(message) = message_stream.next().await {
+                let (message, usage) = message.map_err(|e| ProviderError::RequestFailed(format!("Stream decode error: {}", e)))?;
+                log.write(&message, usage.as_ref().map(|f| f.usage).as_ref())?;
+                yield (message, usage);
+            }
+        }))
     }
 
     /// Fetch supported models from Tetrate Agent Router Service API (only models with tool support)
@@ -250,5 +315,9 @@ impl Provider for TetrateProvider {
 
         models.sort();
         Ok(Some(models))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.supports_streaming
     }
 }

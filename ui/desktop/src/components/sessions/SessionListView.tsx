@@ -1,10 +1,19 @@
 import React, { useEffect, useState, useRef, useCallback, useMemo, startTransition } from 'react';
-import { MessageSquareText, Target, AlertCircle, Calendar, Folder, Edit2 } from 'lucide-react';
-import { fetchSessions, updateSessionMetadata, type Session } from '../../sessions';
+import {
+  MessageSquareText,
+  Target,
+  AlertCircle,
+  Calendar,
+  Folder,
+  Edit2,
+  Trash2,
+  Download,
+  Upload,
+  ExternalLink,
+} from 'lucide-react';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { ScrollArea } from '../ui/scroll-area';
-import { View, ViewOptions } from '../../utils/navigationUtils';
 import { formatMessageTimestamp } from '../../utils/timeUtils';
 import { SearchView } from '../conversation/SearchView';
 import { SearchHighlighter } from '../../utils/searchHighlighter';
@@ -12,6 +21,15 @@ import { MainPanelLayout } from '../Layout/MainPanelLayout';
 import { groupSessionsByDate, type DateGroup } from '../../utils/dateUtils';
 import { Skeleton } from '../ui/skeleton';
 import { toast } from 'react-toastify';
+import { ConfirmationModal } from '../ui/ConfirmationModal';
+import {
+  deleteSession,
+  exportSession,
+  importSession,
+  listSessions,
+  Session,
+  updateSessionName,
+} from '../../api';
 
 interface EditSessionModalProps {
   session: Session | null;
@@ -28,7 +46,7 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
 
     useEffect(() => {
       if (session && isOpen) {
-        setDescription(session.metadata.description || session.id);
+        setDescription(session.name);
       } else if (!isOpen) {
         // Reset state when modal closes
         setDescription('');
@@ -40,14 +58,18 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
       if (!session || disabled) return;
 
       const trimmedDescription = description.trim();
-      if (trimmedDescription === session.metadata.description) {
+      if (trimmedDescription === session.name) {
         onClose();
         return;
       }
 
       setIsUpdating(true);
       try {
-        await updateSessionMetadata(session.id, trimmedDescription);
+        await updateSessionName({
+          path: { session_id: session.id },
+          body: { name: trimmedDescription },
+          throwOnError: true,
+        });
         await onSave(session.id, trimmedDescription);
 
         // Close modal, then show success toast on a timeout to let the UI update complete.
@@ -59,8 +81,7 @@ const EditSessionModal = React.memo<EditSessionModalProps>(
         const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
         console.error('Failed to update session description:', errorMessage);
         toast.error(`Failed to update session description: ${errorMessage}`);
-        // Reset to original description on error
-        setDescription(session.metadata.description || session.id);
+        setDescription(session.name);
       } finally {
         setIsUpdating(false);
       }
@@ -153,7 +174,6 @@ interface SearchContainerElement extends HTMLDivElement {
 }
 
 interface SessionListViewProps {
-  setView: (view: View, viewOptions?: ViewOptions) => void;
   onSelectSession: (sessionId: string) => void;
   selectedSessionId?: string | null;
 }
@@ -173,9 +193,15 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       currentIndex: number;
     } | null>(null);
 
+    const [visibleGroupsCount, setVisibleGroupsCount] = useState(15);
+
     // Edit modal state
     const [showEditModal, setShowEditModal] = useState(false);
     const [editingSession, setEditingSession] = useState<Session | null>(null);
+
+    // Delete confirmation modal state
+    const [showDeleteConfirmation, setShowDeleteConfirmation] = useState(false);
+    const [sessionToDelete, setSessionToDelete] = useState<Session | null>(null);
 
     // Search state for debouncing
     const [searchTerm, setSearchTerm] = useState('');
@@ -194,13 +220,43 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       }
     };
 
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    const visibleDateGroups = useMemo(() => {
+      return dateGroups.slice(0, visibleGroupsCount);
+    }, [dateGroups, visibleGroupsCount]);
+
+    const handleScroll = useCallback(
+      (target: HTMLDivElement) => {
+        const { scrollTop, scrollHeight, clientHeight } = target;
+        const threshold = 200;
+
+        if (
+          scrollHeight - scrollTop - clientHeight < threshold &&
+          visibleGroupsCount < dateGroups.length
+        ) {
+          setVisibleGroupsCount((prev) => Math.min(prev + 5, dateGroups.length));
+        }
+      },
+      [visibleGroupsCount, dateGroups.length]
+    );
+
+    useEffect(() => {
+      if (debouncedSearchTerm) {
+        setVisibleGroupsCount(dateGroups.length);
+      } else {
+        setVisibleGroupsCount(15);
+      }
+    }, [debouncedSearchTerm, dateGroups.length]);
+
     const loadSessions = useCallback(async () => {
       setIsLoading(true);
       setShowSkeleton(true);
       setShowContent(false);
       setError(null);
       try {
-        const sessions = await fetchSessions();
+        const resp = await listSessions<true>({ throwOnError: true });
+        const sessions = resp.data.sessions;
         // Use startTransition to make state updates non-blocking
         startTransition(() => {
           setSessions(sessions);
@@ -278,20 +334,20 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       startTransition(() => {
         const searchTerm = caseSensitive ? debouncedSearchTerm : debouncedSearchTerm.toLowerCase();
         const filtered = sessions.filter((session) => {
-          const description = session.metadata.description || session.id;
-          const path = session.path;
-          const workingDir = session.metadata.working_dir;
+          const description = session.name;
+          const workingDir = session.working_dir;
+          const sessionId = session.id;
 
           if (caseSensitive) {
             return (
               description.includes(searchTerm) ||
-              path.includes(searchTerm) ||
+              sessionId.includes(searchTerm) ||
               workingDir.includes(searchTerm)
             );
           } else {
             return (
               description.toLowerCase().includes(searchTerm) ||
-              path.toLowerCase().includes(searchTerm) ||
+              sessionId.toLowerCase().includes(searchTerm) ||
               workingDir.toLowerCase().includes(searchTerm)
             );
           }
@@ -342,11 +398,7 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
     const handleModalSave = useCallback(async (sessionId: string, newDescription: string) => {
       // Update state immediately for optimistic UI
       setSessions((prevSessions) =>
-        prevSessions.map((s) =>
-          s.id === sessionId
-            ? { ...s, metadata: { ...s.metadata, description: newDescription } }
-            : s
-        )
+        prevSessions.map((s) => (s.id === sessionId ? { ...s, name: newDescription } : s))
       );
     }, []);
 
@@ -355,12 +407,111 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       setShowEditModal(true);
     }, []);
 
+    const handleDeleteSession = useCallback((session: Session) => {
+      setSessionToDelete(session);
+      setShowDeleteConfirmation(true);
+    }, []);
+
+    const handleConfirmDelete = useCallback(async () => {
+      if (!sessionToDelete) return;
+
+      setShowDeleteConfirmation(false);
+      const sessionToDeleteId = sessionToDelete.id;
+      const sessionName = sessionToDelete.name;
+      setSessionToDelete(null);
+
+      try {
+        await deleteSession({
+          path: { session_id: sessionToDeleteId },
+          throwOnError: true,
+        });
+        toast.success('Session deleted successfully');
+      } catch (error) {
+        console.error('Error deleting session:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        toast.error(`Failed to delete session "${sessionName}": ${errorMessage}`);
+      }
+      await loadSessions();
+    }, [sessionToDelete, loadSessions]);
+
+    const handleCancelDelete = useCallback(() => {
+      setShowDeleteConfirmation(false);
+      setSessionToDelete(null);
+    }, []);
+
+    const handleExportSession = useCallback(async (session: Session, e: React.MouseEvent) => {
+      e.stopPropagation();
+
+      const response = await exportSession({
+        path: { session_id: session.id },
+        throwOnError: true,
+      });
+
+      const json = response.data;
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${session.name}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast.success('Session exported successfully');
+    }, []);
+
+    const handleImportClick = useCallback(() => {
+      fileInputRef.current?.click();
+    }, []);
+
+    const handleImportSession = useCallback(
+      async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        try {
+          const json = await file.text();
+          await importSession({
+            body: { json },
+            throwOnError: true,
+          });
+
+          toast.success('Session imported successfully');
+          await loadSessions();
+        } catch (error) {
+          toast.error(`Failed to import session: ${error}`);
+        } finally {
+          if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+          }
+        }
+      },
+      [loadSessions]
+    );
+
+    const handleOpenInNewWindow = useCallback((session: Session, e: React.MouseEvent) => {
+      e.stopPropagation();
+      window.electron.createChatWindow(
+        undefined,
+        session.working_dir,
+        undefined,
+        session.id,
+        'pair'
+      );
+    }, []);
+
     const SessionItem = React.memo(function SessionItem({
       session,
       onEditClick,
+      onDeleteClick,
+      onExportClick,
+      onOpenInNewWindow,
     }: {
       session: Session;
       onEditClick: (session: Session) => void;
+      onDeleteClick: (session: Session) => void;
+      onExportClick: (session: Session, e: React.MouseEvent) => void;
+      onOpenInNewWindow: (session: Session, e: React.MouseEvent) => void;
     }) {
       const handleEditClick = useCallback(
         (e: React.MouseEvent) => {
@@ -370,9 +521,31 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         [onEditClick, session]
       );
 
+      const handleDeleteClick = useCallback(
+        (e: React.MouseEvent) => {
+          e.stopPropagation(); // Prevent card click
+          onDeleteClick(session);
+        },
+        [onDeleteClick, session]
+      );
+
       const handleCardClick = useCallback(() => {
         onSelectSession(session.id);
       }, [session.id]);
+
+      const handleExportClick = useCallback(
+        (e: React.MouseEvent) => {
+          onExportClick(session, e);
+        },
+        [onExportClick, session]
+      );
+
+      const handleOpenInNewWindowClick = useCallback(
+        (e: React.MouseEvent) => {
+          onOpenInNewWindow(session, e);
+        },
+        [onOpenInNewWindow, session]
+      );
 
       return (
         <Card
@@ -380,26 +553,48 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
           className="session-item h-full py-3 px-4 hover:shadow-default cursor-pointer transition-all duration-150 flex flex-col justify-between relative group"
           ref={(el) => setSessionRefs(session.id, el)}
         >
-          <button
-            onClick={handleEditClick}
-            className="absolute top-3 right-4 p-2 rounded opacity-0 group-hover:opacity-100 transition-opacity hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
-            title="Edit session name"
-          >
-            <Edit2 className="w-3 h-3 text-textSubtle hover:text-textStandard" />
-          </button>
+          <div className="flex items-start justify-between gap-2 mb-1">
+            <h3 className="text-base break-words line-clamp-2 flex-1 min-w-0">{session.name}</h3>
+            <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
+              <button
+                onClick={handleOpenInNewWindowClick}
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+                title="Open in new window"
+              >
+                <ExternalLink className="w-3 h-3 text-textSubtle hover:text-textStandard" />
+              </button>
+              <button
+                onClick={handleEditClick}
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+                title="Edit session name"
+              >
+                <Edit2 className="w-3 h-3 text-textSubtle hover:text-textStandard" />
+              </button>
+              <button
+                onClick={handleDeleteClick}
+                className="p-2 rounded hover:bg-red-50 dark:hover:bg-red-900/20 cursor-pointer transition-colors"
+                title="Delete session"
+              >
+                <Trash2 className="w-3 h-3 text-red-500 hover:text-red-600" />
+              </button>
+              <button
+                onClick={handleExportClick}
+                className="p-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 cursor-pointer"
+                title="Export session"
+              >
+                <Download className="w-3 h-3 text-textSubtle hover:text-textStandard" />
+              </button>
+            </div>
+          </div>
 
           <div className="flex-1">
-            <h3 className="text-base mb-1 pr-6 break-words">
-              {session.metadata.description || session.id}
-            </h3>
-
             <div className="flex items-center text-text-muted text-xs mb-1">
               <Calendar className="w-3 h-3 mr-1 flex-shrink-0" />
-              <span>{formatMessageTimestamp(Date.parse(session.modified) / 1000)}</span>
+              <span>{formatMessageTimestamp(Date.parse(session.updated_at) / 1000)}</span>
             </div>
             <div className="flex items-center text-text-muted text-xs mb-1">
               <Folder className="w-3 h-3 mr-1 flex-shrink-0" />
-              <span className="truncate">{session.metadata.working_dir}</span>
+              <span className="truncate">{session.working_dir}</span>
             </div>
           </div>
 
@@ -407,14 +602,12 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
             <div className="flex items-center space-x-3 text-xs text-text-muted">
               <div className="flex items-center">
                 <MessageSquareText className="w-3 h-3 mr-1" />
-                <span className="font-mono">{session.metadata.message_count}</span>
+                <span className="font-mono">{session.message_count}</span>
               </div>
-              {session.metadata.total_tokens !== null && (
+              {session.total_tokens !== null && (
                 <div className="flex items-center">
                   <Target className="w-3 h-3 mr-1" />
-                  <span className="font-mono">
-                    {session.metadata.total_tokens.toLocaleString()}
-                  </span>
+                  <span className="font-mono">{(session.total_tokens || 0).toLocaleString()}</span>
                 </div>
               )}
             </div>
@@ -423,7 +616,6 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
       );
     });
 
-    // Render skeleton loader for session items with variations
     const SessionSkeleton = React.memo(({ variant = 0 }: { variant?: number }) => {
       const titleWidths = ['w-3/4', 'w-2/3', 'w-4/5', 'w-1/2'];
       const pathWidths = ['w-32', 'w-28', 'w-36', 'w-24'];
@@ -495,21 +687,36 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
         );
       }
 
-      // For regular rendering in grid layout
       return (
         <div className="space-y-8">
-          {dateGroups.map((group) => (
+          {visibleDateGroups.map((group) => (
             <div key={group.label} className="space-y-4">
               <div className="sticky top-0 z-10 bg-background-default/95 backdrop-blur-sm">
                 <h2 className="text-text-muted">{group.label}</h2>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
                 {group.sessions.map((session) => (
-                  <SessionItem key={session.id} session={session} onEditClick={handleEditSession} />
+                  <SessionItem
+                    key={session.id}
+                    session={session}
+                    onEditClick={handleEditSession}
+                    onDeleteClick={handleDeleteSession}
+                    onExportClick={handleExportSession}
+                    onOpenInNewWindow={handleOpenInNewWindow}
+                  />
                 ))}
               </div>
             </div>
           ))}
+
+          {visibleGroupsCount < dateGroups.length && (
+            <div className="flex justify-center py-8">
+              <div className="flex items-center space-x-2 text-text-muted">
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-text-muted"></div>
+                <span>Loading more sessions...</span>
+              </div>
+            </div>
+          )}
         </div>
       );
     };
@@ -522,21 +729,31 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
               <div className="flex flex-col page-transition">
                 <div className="flex justify-between items-center mb-1">
                   <h1 className="text-4xl font-light">Chat history</h1>
+                  <Button
+                    onClick={handleImportClick}
+                    variant="outline"
+                    size="sm"
+                    className="flex items-center gap-2"
+                  >
+                    <Upload className="w-4 h-4" />
+                    Import Session
+                  </Button>
                 </div>
                 <p className="text-sm text-text-muted mb-4">
-                  View and search your past conversations with Goose.
+                  View and search your past conversations with Goose. ⌘F/Ctrl+F to search.
                 </p>
               </div>
             </div>
 
             <div className="flex-1 min-h-0 relative px-8">
-              <ScrollArea className="h-full" data-search-scroll-area>
+              <ScrollArea handleScroll={handleScroll} className="h-full" data-search-scroll-area>
                 <div ref={containerRef} className="h-full relative">
                   <SearchView
                     onSearch={handleSearch}
                     onNavigate={handleSearchNavigation}
                     searchResults={searchResults}
                     className="relative"
+                    placeholder="Search history..."
                   >
                     {/* Skeleton layer - always rendered but conditionally visible */}
                     <div
@@ -599,11 +816,30 @@ const SessionListView: React.FC<SessionListViewProps> = React.memo(
           </div>
         </MainPanelLayout>
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json"
+          onChange={handleImportSession}
+          className="hidden"
+        />
+
         <EditSessionModal
           session={editingSession}
           isOpen={showEditModal}
           onClose={handleModalClose}
           onSave={handleModalSave}
+        />
+
+        <ConfirmationModal
+          isOpen={showDeleteConfirmation}
+          title="Delete Session"
+          message={`Are you sure you want to delete the session "${sessionToDelete?.name}"? This action cannot be undone.`}
+          confirmLabel="Delete Session"
+          cancelLabel="Cancel"
+          confirmVariant="destructive"
+          onConfirm={handleConfirmDelete}
+          onCancel={handleCancelDelete}
         />
       </>
     );

@@ -1,25 +1,23 @@
-name: 🧑‍🍳 Submit a Recipe to the Goose Cookbook
-description: Share a reusable Goose recipe with the community!
+name: 🧑‍🍳 Submit a recipe to the goose cookbook
+description: Share a reusable goose recipe with the community!
 title: "[Recipe] <your recipe title here>"
 labels: ["recipe submission"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for contributing to the Goose Cookbook! 🍳  
-        Recipes are reusable sessions created in Goose Desktop or CLI and shared with the community to help others vibe code faster.
+        Thanks for contributing to the goose cookbook! 🍳  
+        Recipes are reusable sessions created in goose desktop or CLI and shared with the community to help others vibe code faster.
 
         📌 **How to Submit**
-        - Create your recipe using Goose ("Make recipe from this session")
+        - Create your recipe using goose ("Make recipe from this session")
         - Fill out the YAML below using the format provided
-        - Paste it into the field and submit the issue — we'll review and add it to the Cookbook!
+        - Paste it into the field and submit the issue — we'll review and add it to the cookbook!
 
         🪄 **What Happens After?**
-        - If accepted, we'll publish your recipe to the [Goose Recipes Cookbook](https://block.github.io/goose/recipes)
-        - You'll receive OpenRouter **LLM API credits** as a thank you!
+        - If accepted, we'll publish your recipe to the [goose recipes cookbook](https://block.github.io/goose/recipes)
         - Your GitHub handle will be displayed and linked on the recipe card
-        - If you provide an email below, we'll email you your credits when your recipe is approved and merged.
-        - If the YAML has any issues, Goose will comment with validation errors so you can fix and resubmit.
+        - If the YAML has any issues, goose will comment with validation errors so you can fix and resubmit.
 
         🧪 **Pro Tip:** You can test your recipe locally in your terminal with:  
         `goose recipe validate your-recipe.yaml`
@@ -28,7 +26,7 @@ body:
     id: recipe-yaml
     attributes:
       label: Paste Your Full Recipe YAML Below
-      description: Use the structure below and we’ll auto-fill your GitHub handle for `author.contact` after submission.
+      description: Use the structure below and we'll auto-fill your GitHub handle for `author.contact` after submission.
       placeholder: |
         version: "1.0.0"
         id: clean-up-feature-flag
@@ -86,15 +84,6 @@ body:
     validations:
       required: true
 
-  - type: input
-    id: email
-    attributes:
-      label: Your Email (optional)
-      description: If your recipe is approved, we'll email your LLM API credits here.
-      placeholder: yourname@example.com
-    validations:
-      required: false
-
   - type: markdown
     attributes:
       value: |
@@ -103,8 +92,8 @@ body:
         - `id` should be lowercase, hyphenated, and unique (e.g. `my-awesome-recipe`)
         - `title` is the display name of your recipe
         - `description` should clearly explain what the recipe does
-        - `instructions` are specific steps Goose should follow — supports template variables like `{{ variable_name }}`
-        - `prompt` is the first thing Goose sees when the recipe is launched
+        - `instructions` are specific steps goose should follow — supports template variables like `{{ variable_name }}`
+        - `prompt` is the first thing goose sees when the recipe is launched
         - `parameters` should include required or optional inputs — optional ones must have `default`
         - `extensions` must follow the full format with `type`, `cmd`, `args`, `timeout`, etc.
         - `activities` describe the main actions the recipe performs

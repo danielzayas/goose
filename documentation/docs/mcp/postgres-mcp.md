@@ -1,6 +1,7 @@
 ---
 title: PostgreSQL Extension
-description: Add PostgreSQL MCP Server as a Goose Extension
+description: Add PostgreSQL MCP Server as a goose Extension
+unlisted: true
 ---
 
 import Tabs from '@theme/Tabs';
@@ -10,14 +11,16 @@ import GooseDesktopInstaller from '@site/src/components/GooseDesktopInstaller';
 
 <YouTubeShortEmbed videoUrl="https://www.youtube.com/embed/PZlYQ5IthYM" />
 
-The PostgreSQL MCP Server extension allows Goose to interact directly with your PostgreSQL databases, enabling database operations, querying, and schema management capabilities. This makes it easy to work with your databases through natural language interactions.
+Server archived
+
+The PostgreSQL MCP Server extension allows goose to interact directly with your PostgreSQL databases, enabling database operations, querying, and schema management capabilities. This makes it easy to work with your databases through natural language interactions.
 
 :::tip TLDR
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   [Launch the installer](goose://extension?cmd=npx&arg=-y&arg=@modelcontextprotocol/server-postgres&arg=Your%20PostgreSQL%20connection%20URL&id=postgres&name=PostgreSQL&description=PostgreSQL%20database%20integration)
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   **Command**
   ```sh
   npx -y @modelcontextprotocol/server-postgres postgresql://localhost/mydb
@@ -60,7 +63,7 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
 :::
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   <GooseDesktopInstaller
     extensionId="postgres"
     extensionName="PostgreSQL"
@@ -74,7 +77,7 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
   :::
 
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   1. Run the `configure` command:
   ```sh
   goose configure
@@ -207,14 +210,14 @@ Note that you'll need [Node.js](https://nodejs.org/) installed on your system to
 
 The PostgreSQL extension enables you to query and analyze data or give you information about the table structures. The extension is only capable of *read-only* operations, so you can use it to get information about your database, but not to modify it.
 
-Just describe what you want to do in natural language, and Goose will help you accomplish it using the appropriate SQL commands and PostgreSQL features.
+Just describe what you want to do in natural language, and goose will help you accomplish it using the appropriate SQL commands and PostgreSQL features.
 
-#### Goose Prompt
+#### goose Prompt
 ```
 Search my database for any students whose current GPA is higher than the average in their current grade level. Tell me their name, grade, and how much they exceed their grade’s average GPA, and the average GPA.
 ```
 
-#### Goose Output
+#### goose Output
 ```
 Based on the query results, here are the students who are performing above their grade level average:
 

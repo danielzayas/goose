@@ -1,7 +1,7 @@
-import { Sliders, ChefHat, Bot, Eye, Save } from 'lucide-react';
+import { Sliders, Bot } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import { useModelAndProvider } from '../../../ModelAndProviderContext';
-import { AddModelModal } from '../subcomponents/AddModelModal';
+import { SwitchModelModal } from '../subcomponents/SwitchModelModal';
 import { LeadWorkerSettings } from '../subcomponents/LeadWorkerSettings';
 import { View } from '../../../../utils/navigationUtils';
 import {
@@ -9,32 +9,25 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-  DropdownMenuSeparator,
 } from '../../../ui/dropdown-menu';
 import { useCurrentModelInfo } from '../../../BaseChat';
 import { useConfig } from '../../../ConfigContext';
 import { getProviderMetadata } from '../modelInterface';
 import { Alert } from '../../../alerts';
 import BottomMenuAlertPopover from '../../../bottom_menu/BottomMenuAlertPopover';
-import { Recipe } from '../../../../recipe';
-import { saveRecipe, generateRecipeFilename } from '../../../../recipe/recipeStorage';
-import { toastSuccess, toastError } from '../../../../toasts';
-import ViewRecipeModal from '../../../ViewRecipeModal';
 
 interface ModelsBottomBarProps {
+  sessionId: string | null;
   dropdownRef: React.RefObject<HTMLDivElement>;
   setView: (view: View) => void;
   alerts: Alert[];
-  recipeConfig?: Recipe | null;
-  hasMessages?: boolean; // Add prop to know if there are messages to create a recipe from
 }
 
 export default function ModelsBottomBar({
+  sessionId,
   dropdownRef,
   setView,
   alerts,
-  recipeConfig,
-  hasMessages = false,
 }: ModelsBottomBarProps) {
   const {
     currentModel,
@@ -51,15 +44,6 @@ export default function ModelsBottomBar({
   const [isLeadWorkerModalOpen, setIsLeadWorkerModalOpen] = useState(false);
   const [isLeadWorkerActive, setIsLeadWorkerActive] = useState(false);
   const [providerDefaultModel, setProviderDefaultModel] = useState<string | null>(null);
-
-  // Save recipe dialog state (like in RecipeEditor.tsx)
-  const [showSaveDialog, setShowSaveDialog] = useState(false);
-  const [saveRecipeName, setSaveRecipeName] = useState('');
-  const [saveGlobal, setSaveGlobal] = useState(true);
-  const [saving, setSaving] = useState(false);
-
-  // View recipe modal state
-  const [showViewRecipeModal, setShowViewRecipeModal] = useState(false);
 
   // Check if lead/worker mode is active
   useEffect(() => {
@@ -168,60 +152,6 @@ export default function ModelsBottomBar({
     })();
   }, [currentModel, getCurrentModelDisplayName]);
 
-  // Handle view recipe - open modal instead of navigating
-  const handleViewRecipe = () => {
-    if (recipeConfig) {
-      setShowViewRecipeModal(true);
-    }
-  };
-
-  // Handle save recipe - show save dialog (like in RecipeEditor.tsx)
-  const handleSaveRecipeClick = () => {
-    if (recipeConfig) {
-      const suggestedName = generateRecipeFilename(recipeConfig);
-      setSaveRecipeName(suggestedName);
-      setShowSaveDialog(true);
-    }
-  };
-
-  // Handle save recipe (like in RecipeEditor.tsx)
-  const handleSaveRecipe = async () => {
-    if (!saveRecipeName.trim() || !recipeConfig) {
-      return;
-    }
-
-    setSaving(true);
-    try {
-      if (!recipeConfig.title || !recipeConfig.description || !recipeConfig.instructions) {
-        throw new Error('Invalid recipe configuration: missing required fields');
-      }
-
-      await saveRecipe(recipeConfig, {
-        name: saveRecipeName.trim(),
-        global: saveGlobal,
-      });
-
-      // Reset dialog state
-      setShowSaveDialog(false);
-      setSaveRecipeName('');
-
-      toastSuccess({
-        title: saveRecipeName.trim(),
-        msg: `Recipe saved successfully`,
-      });
-    } catch (error) {
-      console.error('Failed to save recipe:', error);
-
-      toastError({
-        title: 'Save Failed',
-        msg: `Failed to save recipe: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        traceback: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
   return (
     <div className="relative flex items-center" ref={dropdownRef}>
       <BottomMenuAlertPopover alerts={alerts} />
@@ -251,135 +181,20 @@ export default function ModelsBottomBar({
             <span>Lead/Worker Settings</span>
             <Sliders className="ml-auto h-4 w-4" />
           </DropdownMenuItem>
-
-          {/* Recipe-specific menu items - only show when actively using a recipe */}
-          {recipeConfig && (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleViewRecipe}>
-                <span>View/Edit Recipe</span>
-                <Eye className="ml-auto h-4 w-4" />
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={handleSaveRecipeClick}>
-                <span>Save Recipe</span>
-                <Save className="ml-auto h-4 w-4" />
-              </DropdownMenuItem>
-            </>
-          )}
-
-          <DropdownMenuSeparator />
-          {/* Only show "Create a recipe from this session" when there are messages to create from */}
-          {hasMessages && (
-            <DropdownMenuItem
-              onClick={() => {
-                // Signal to create an agent from the current chat
-                window.dispatchEvent(new CustomEvent('make-agent-from-chat'));
-              }}
-            >
-              <span>Create a recipe from this session</span>
-              <ChefHat className="ml-auto h-4 w-4" />
-            </DropdownMenuItem>
-          )}
         </DropdownMenuContent>
       </DropdownMenu>
 
       {isAddModelModalOpen ? (
-        <AddModelModal setView={setView} onClose={() => setIsAddModelModalOpen(false)} />
+        <SwitchModelModal
+          sessionId={sessionId}
+          setView={setView}
+          onClose={() => setIsAddModelModalOpen(false)}
+        />
       ) : null}
 
       {isLeadWorkerModalOpen ? (
         <LeadWorkerSettings isOpen={isLeadWorkerModalOpen} onClose={handleLeadWorkerModalClose} />
       ) : null}
-
-      {/* Save Recipe Dialog - copied from RecipeEditor.tsx */}
-      {showSaveDialog && (
-        <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50">
-          <div className="bg-background-default border border-borderSubtle rounded-lg p-6 w-96 max-w-[90vw]">
-            <h3 className="text-lg font-medium text-textProminent mb-4">Save Recipe</h3>
-
-            <div className="space-y-4">
-              <div>
-                <label
-                  htmlFor="recipe-name"
-                  className="block text-sm font-medium text-textStandard mb-2"
-                >
-                  Recipe Name
-                </label>
-                <input
-                  id="recipe-name"
-                  type="text"
-                  value={saveRecipeName}
-                  onChange={(e) => setSaveRecipeName(e.target.value)}
-                  className="w-full p-3 border border-borderSubtle rounded-lg bg-background-default text-textStandard focus:outline-none focus:ring-2 focus:ring-borderProminent"
-                  placeholder="Enter recipe name"
-                  autoFocus
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-textStandard mb-2">
-                  Save Location
-                </label>
-                <div className="space-y-2">
-                  <label className="flex items-center">
-                    <input
-                      type="radio"
-                      name="save-location"
-                      checked={saveGlobal}
-                      onChange={() => setSaveGlobal(true)}
-                      className="mr-2"
-                    />
-                    <span className="text-sm text-textStandard">
-                      Global - Available across all Goose sessions
-                    </span>
-                  </label>
-                  <label className="flex items-center">
-                    <input
-                      type="radio"
-                      name="save-location"
-                      checked={!saveGlobal}
-                      onChange={() => setSaveGlobal(false)}
-                      className="mr-2"
-                    />
-                    <span className="text-sm text-textStandard">
-                      Directory - Available in the working directory
-                    </span>
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            <div className="flex justify-end space-x-3 mt-6">
-              <button
-                onClick={() => {
-                  setShowSaveDialog(false);
-                  setSaveRecipeName('');
-                }}
-                className="px-4 py-2 text-textSubtle hover:text-textStandard transition-colors"
-                disabled={saving}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveRecipe}
-                disabled={!saveRecipeName.trim() || saving}
-                className="px-4 py-2 bg-textProminent text-bgApp rounded-lg hover:bg-opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {saving ? 'Saving...' : 'Save Recipe'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* View Recipe Modal */}
-      {recipeConfig && (
-        <ViewRecipeModal
-          isOpen={showViewRecipeModal}
-          onClose={() => setShowViewRecipeModal(false)}
-          config={recipeConfig}
-        />
-      )}
     </div>
   );
 }

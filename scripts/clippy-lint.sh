@@ -12,13 +12,28 @@ source "$SCRIPT_DIR/clippy-baseline.sh"
 
 echo "🔍 Running all clippy checks..."
 
-# Run standard clippy with strict warnings
-echo "  → Standard clippy rules (strict)"
-cargo clippy --jobs 2 -- -D warnings
+FIX_MODE=0
+[[ "$1" == "--fix" ]] && FIX_MODE=1
 
-# Run baseline rules check
+run_clippy() {
+  if [[ "$FIX_MODE" -eq 1 ]]; then
+    cargo fmt
+    cargo clippy --all-targets --jobs 2 \
+      --fix --allow-dirty --allow-staged \
+      -- -D warnings
+  else
+    cargo clippy --all-targets --jobs 2 -- -D warnings
+  fi
+}
+
+if [[ "$FIX_MODE" -eq 1 ]]; then
+  echo "🛠  Applying fixes..."
+else
+  echo "🔍 Running clippy..."
+fi
+
+run_clippy
 echo ""
 check_all_baseline_rules
-
 echo ""
-echo "✅ All lint checks passed!"
+echo "✅ Done"

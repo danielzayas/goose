@@ -1,34 +1,35 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { FolderKey, ScrollText } from 'lucide-react';
+import { Bug, ScrollText, ChefHat } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/Tooltip';
 import { Button } from './ui/button';
 import type { View } from '../utils/navigationUtils';
 import Stop from './ui/Stop';
 import { Attach, Send, Close, Microphone } from './icons';
 import { ChatState } from '../types/chatState';
-import { debounce } from 'lodash';
+import debounce from 'lodash/debounce';
 import { LocalMessageStorage } from '../utils/localMessageStorage';
-import { Message } from '../types/message';
 import { DirSwitcher } from './bottom_menu/DirSwitcher';
 import ModelsBottomBar from './settings/models/bottom_bar/ModelsBottomBar';
 import { BottomMenuModeSelection } from './bottom_menu/BottomMenuModeSelection';
+import { BottomMenuExtensionSelection } from './bottom_menu/BottomMenuExtensionSelection';
 import { AlertType, useAlerts } from './alerts';
-import { useToolCount } from './alerts/useToolCount';
 import { useConfig } from './ConfigContext';
 import { useModelAndProvider } from './ModelAndProviderContext';
 import { useWhisper } from '../hooks/useWhisper';
 import { WaveformVisualizer } from './WaveformVisualizer';
 import { toastError } from '../toasts';
-import MentionPopover, { FileItemWithMatch } from './MentionPopover';
+import MentionPopover, { DisplayItemWithMatch } from './MentionPopover';
 import { useDictationSettings } from '../hooks/useDictationSettings';
-import { useContextManager } from './context_management/ContextManager';
-import { useChatContext } from '../contexts/ChatContext';
-import { COST_TRACKING_ENABLED } from '../updates';
+import { COST_TRACKING_ENABLED, VOICE_DICTATION_ELEVENLABS_ENABLED } from '../updates';
 import { CostTracker } from './bottom_menu/CostTracker';
 import { DroppedFile, useFileDrop } from '../hooks/useFileDrop';
 import { Recipe } from '../recipe';
 import MessageQueue from './MessageQueue';
 import { detectInterruption } from '../utils/interruptionDetector';
+import { DiagnosticsModal } from './ui/DownloadDiagnostics';
+import { Message } from '../api';
+import CreateRecipeFromSessionModal from './recipes/CreateRecipeFromSessionModal';
+import CreateEditRecipeModal from './recipes/CreateEditRecipeModal';
 
 interface QueuedMessage {
   id: string;
@@ -52,25 +53,28 @@ const MAX_IMAGE_SIZE_MB = 5;
 const TOKEN_LIMIT_DEFAULT = 128000; // fallback for custom models that the backend doesn't know about
 const TOOLS_MAX_SUGGESTED = 60; // max number of tools before we show a warning
 
+// Manual compact trigger message - must match backend constant
+const MANUAL_COMPACT_TRIGGER = 'Please compact this conversation';
+
 interface ModelLimit {
   pattern: string;
   context_limit: number;
 }
 
 interface ChatInputProps {
+  sessionId: string | null;
   handleSubmit: (e: React.FormEvent) => void;
   chatState: ChatState;
   onStop?: () => void;
-  commandHistory?: string[]; // Current chat's message history
+  commandHistory?: string[];
   initialValue?: string;
   droppedFiles?: DroppedFile[];
-  onFilesProcessed?: () => void; // Callback to clear dropped files after processing
+  onFilesProcessed?: () => void;
   setView: (view: View) => void;
-  numTokens?: number;
-  inputTokens?: number;
-  outputTokens?: number;
+  totalTokens?: number;
+  accumulatedInputTokens?: number;
+  accumulatedOutputTokens?: number;
   messages?: Message[];
-  setMessages: (messages: Message[]) => void;
   sessionCosts?: {
     [key: string]: {
       inputTokens: number;
@@ -78,17 +82,18 @@ interface ChatInputProps {
       totalCost: number;
     };
   };
-  setIsGoosehintsModalOpen?: (isOpen: boolean) => void;
   disableAnimation?: boolean;
-  recipeConfig?: Recipe | null;
+  recipe?: Recipe | null;
+  recipeId?: string | null;
   recipeAccepted?: boolean;
   initialPrompt?: string;
-  autoSubmit: boolean;
-  setAncestorMessages?: (messages: Message[]) => void;
+  toolCount: number;
   append?: (message: Message) => void;
+  isExtensionsLoading?: boolean;
 }
 
 export default function ChatInput({
+  sessionId,
   handleSubmit,
   chatState = ChatState.Idle,
   onStop,
@@ -97,20 +102,19 @@ export default function ChatInput({
   droppedFiles = [],
   onFilesProcessed,
   setView,
-  numTokens,
-  inputTokens,
-  outputTokens,
+  totalTokens,
+  accumulatedInputTokens,
+  accumulatedOutputTokens,
   messages = [],
-  setMessages,
   disableAnimation = false,
   sessionCosts,
-  setIsGoosehintsModalOpen,
-  recipeConfig,
+  recipe,
+  recipeId,
   recipeAccepted,
   initialPrompt,
-  autoSubmit = false,
-  append,
-  setAncestorMessages,
+  toolCount,
+  append: _append,
+  isExtensionsLoading = false,
 }: ChatInputProps) {
   const [_value, setValue] = useState(initialValue);
   const [displayValue, setDisplayValue] = useState(initialValue); // For immediate visual feedback
@@ -131,23 +135,14 @@ export default function ChatInput({
   const dropdownRef: React.RefObject<HTMLDivElement> = useRef<HTMLDivElement>(
     null
   ) as React.RefObject<HTMLDivElement>;
-  const toolCount = useToolCount();
-  const { isCompacting, handleManualCompaction } = useContextManager();
   const { getProviders, read } = useConfig();
   const { getCurrentModelAndProvider, currentModel, currentProvider } = useModelAndProvider();
   const [tokenLimit, setTokenLimit] = useState<number>(TOKEN_LIMIT_DEFAULT);
   const [isTokenLimitLoaded, setIsTokenLimitLoaded] = useState(false);
-
-  // Draft functionality - get chat context and global draft context
-  // We need to handle the case where ChatInput is used without ChatProvider (e.g., in Hub)
-  const chatContext = useChatContext(); // This should always be available now
-  const agentIsReady = chatContext === null || chatContext.agentWaitingMessage === null;
-  const draftLoadedRef = useRef(false);
-
-  // Debug logging for draft context
-  useEffect(() => {
-    // Debug logging removed - draft functionality is working correctly
-  }, [chatContext?.contextKey, chatContext?.draft, chatContext]);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [showCreateRecipeModal, setShowCreateRecipeModal] = useState(false);
+  const [showEditRecipeModal, setShowEditRecipeModal] = useState(false);
+  const [isFilePickerOpen, setIsFilePickerOpen] = useState(false);
 
   // Save queue state (paused/interrupted) to storage
   useEffect(() => {
@@ -221,15 +216,17 @@ export default function ChatInput({
     query: string;
     mentionStart: number;
     selectedIndex: number;
+    isSlashCommand: boolean;
   }>({
     isOpen: false,
     position: { x: 0, y: 0 },
     query: '',
     mentionStart: -1,
     selectedIndex: 0,
+    isSlashCommand: false,
   });
   const mentionPopoverRef = useRef<{
-    getDisplayFiles: () => FileItemWithMatch[];
+    getDisplayFiles: () => DisplayItemWithMatch[];
     selectFile: (index: number) => void;
   }>(null);
 
@@ -274,9 +271,6 @@ export default function ChatInput({
     setValue(initialValue);
     setDisplayValue(initialValue);
 
-    // Reset draft loaded flag when initialValue changes
-    draftLoadedRef.current = false;
-
     // Use a functional update to get the current pastedImages
     // and perform cleanup. This avoids needing pastedImages in the deps.
     setPastedImages((currentPastedImages) => {
@@ -294,66 +288,17 @@ export default function ChatInput({
     setHasUserTyped(false);
   }, [initialValue]); // Keep only initialValue as a dependency
 
-  // Track if we've already set the recipe prompt to avoid re-setting it
-  const hasSetRecipePromptRef = useRef(false);
-
   // Handle recipe prompt updates
   useEffect(() => {
     // If recipe is accepted and we have an initial prompt, and no messages yet, and we haven't set it before
-    if (
-      recipeAccepted &&
-      initialPrompt &&
-      messages.length === 0 &&
-      !hasSetRecipePromptRef.current
-    ) {
+    if (recipeAccepted && initialPrompt && messages.length === 0) {
       setDisplayValue(initialPrompt);
       setValue(initialPrompt);
-      hasSetRecipePromptRef.current = true;
       setTimeout(() => {
         textAreaRef.current?.focus();
       }, 0);
     }
-    // we don't need hasSetRecipePromptRef in the dependency array because it is a ref that persists across renders
   }, [recipeAccepted, initialPrompt, messages.length]);
-
-  // Reset the recipe prompt flag when the recipe changes or messages are added
-  useEffect(() => {
-    if (messages.length > 0 || !recipeAccepted || !initialPrompt) {
-      hasSetRecipePromptRef.current = false;
-    }
-  }, [recipeAccepted, initialPrompt, messages.length]);
-
-  // Draft functionality - load draft if no initial value or recipe
-  useEffect(() => {
-    // Reset draft loaded flag when context changes
-    draftLoadedRef.current = false;
-  }, [chatContext?.contextKey]);
-
-  useEffect(() => {
-    // Only load draft once and if conditions are met
-    if (!initialValue && !recipeConfig && !draftLoadedRef.current && chatContext) {
-      const draftText = chatContext.draft || '';
-
-      if (draftText) {
-        setDisplayValue(draftText);
-        setValue(draftText);
-      }
-
-      // Always mark as loaded after checking, regardless of whether we found a draft
-      draftLoadedRef.current = true;
-    }
-  }, [chatContext, initialValue, recipeConfig]);
-
-  // Save draft when user types (debounced)
-  const debouncedSaveDraft = useMemo(
-    () =>
-      debounce((value: string) => {
-        if (chatContext && chatContext.setDraft) {
-          chatContext.setDraft(value);
-        }
-      }, 500), // Save draft after 500ms of no typing
-    [chatContext]
-  );
 
   // State to track if the IME is composing (i.e., in the middle of Japanese IME input)
   const [isComposing, setIsComposing] = useState(false);
@@ -363,7 +308,6 @@ export default function ChatInput({
   const [hasUserTyped, setHasUserTyped] = useState(false);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   const timeoutRefsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
-  const [didAutoSubmit, setDidAutoSubmit] = useState<boolean>(false);
 
   // Use shared file drop hook for ChatInput
   const {
@@ -515,24 +459,24 @@ export default function ChatInput({
     clearAlerts();
 
     // Show alert when either there is registered token usage, or we know the limit
-    if ((numTokens && numTokens > 0) || (isTokenLimitLoaded && tokenLimit)) {
-      // in these conditions we want it to be present but disabled
-      const compactButtonDisabled = !numTokens || isCompacting;
-
+    if ((totalTokens && totalTokens > 0) || (isTokenLimitLoaded && tokenLimit)) {
       addAlert({
         type: AlertType.Info,
         message: 'Context window',
         progress: {
-          current: numTokens || 0,
+          current: totalTokens || 0,
           total: tokenLimit,
         },
         showCompactButton: true,
-        compactButtonDisabled,
+        compactButtonDisabled: !totalTokens,
         onCompact: () => {
-          // Hide the alert popup by dispatching a custom event that the popover can listen to
-          // Importantly, this leaves the alert so the dot still shows up, but hides the popover
           window.dispatchEvent(new CustomEvent('hide-alert-popover'));
-          handleManualCompaction(messages, setMessages, append, setAncestorMessages);
+
+          const customEvent = new CustomEvent('submit', {
+            detail: { value: MANUAL_COMPACT_TRIGGER },
+          }) as unknown as React.FormEvent;
+
+          handleSubmit(customEvent);
         },
         compactIcon: <ScrollText size={12} />,
       });
@@ -552,7 +496,7 @@ export default function ChatInput({
     }
     // We intentionally omit setView as it shouldn't trigger a re-render of alerts
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numTokens, toolCount, tokenLimit, isTokenLimitLoaded, addAlert, isCompacting, clearAlerts]);
+  }, [totalTokens, toolCount, tokenLimit, isTokenLimitLoaded, addAlert, clearAlerts]);
 
   // Cleanup effect for component unmount - prevent memory leaks
   useEffect(() => {
@@ -618,20 +562,20 @@ export default function ChatInput({
     const val = evt.target.value;
     const cursorPosition = evt.target.selectionStart;
 
-    setDisplayValue(val); // Update display immediately
-    updateValue(val); // Update actual value immediately for better responsiveness
-    debouncedSaveDraft(val); // Save draft with debounce
-    // Mark that the user has typed something
+    setDisplayValue(val);
+    updateValue(val);
     setHasUserTyped(true);
-
-    // Check for @ mention
-    checkForMention(val, cursorPosition, evt.target);
+    checkForMentionOrSlash(val, cursorPosition, evt.target);
   };
 
-  const checkForMention = (text: string, cursorPosition: number, textArea: HTMLTextAreaElement) => {
-    // Find the last @ before the cursor
+  const checkForMentionOrSlash = (
+    text: string,
+    cursorPosition: number,
+    textArea: HTMLTextAreaElement
+  ) => {
+    const isSlashCommand = text.startsWith('/');
     const beforeCursor = text.slice(0, cursorPosition);
-    const lastAtIndex = beforeCursor.lastIndexOf('@');
+    const lastAtIndex = isSlashCommand ? 0 : beforeCursor.lastIndexOf('@');
 
     if (lastAtIndex === -1) {
       // No @ found, close mention popover
@@ -659,6 +603,7 @@ export default function ChatInput({
       query: afterAt,
       mentionStart: lastAtIndex,
       selectedIndex: 0, // Reset selection when query changes
+      isSlashCommand,
       // filteredFiles will be populated by the MentionPopover component
     }));
   };
@@ -779,9 +724,8 @@ export default function ChatInput({
   useEffect(() => {
     return () => {
       debouncedAutosize.cancel?.();
-      debouncedSaveDraft.cancel?.();
     };
-  }, [debouncedAutosize, debouncedSaveDraft]);
+  }, [debouncedAutosize]);
 
   // Handlers for composition events, which are crucial for proper IME behavior
   const handleCompositionStart = () => {
@@ -918,6 +862,12 @@ export default function ChatInput({
     return true; // Return true if message was queued
   };
 
+  const canSubmit =
+    !isLoading &&
+    (displayValue.trim() ||
+      pastedImages.some((img) => img.filePath && !img.error && !img.isLoading) ||
+      allDroppedFiles.some((file) => !file.error && !file.isLoading));
+
   const performSubmit = useCallback(
     (text?: string) => {
       const validPastedImageFilesPaths = pastedImages
@@ -967,11 +917,6 @@ export default function ChatInput({
         setIsInGlobalHistory(false);
         setHasUserTyped(false);
 
-        // Clear draft when message is sent
-        if (chatContext && chatContext.clearDraft) {
-          chatContext.clearDraft();
-        }
-
         // Clear both parent and local dropped files after processing
         if (onFilesProcessed && droppedFiles.length > 0) {
           onFilesProcessed();
@@ -983,7 +928,6 @@ export default function ChatInput({
     },
     [
       allDroppedFiles,
-      chatContext,
       displayValue,
       droppedFiles.length,
       handleSubmit,
@@ -994,13 +938,6 @@ export default function ChatInput({
       setLocalDroppedFiles,
     ]
   );
-
-  useEffect(() => {
-    if (!!autoSubmit && !didAutoSubmit) {
-      setDidAutoSubmit(true);
-      performSubmit(initialValue);
-    }
-  }, [autoSubmit, didAutoSubmit, initialValue, performSubmit]);
 
   const handleKeyDown = (evt: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // If mention popover is open, handle arrow keys and enter
@@ -1059,13 +996,6 @@ export default function ChatInput({
         return;
       }
 
-      const canSubmit =
-        !isLoading &&
-        !isCompacting &&
-        agentIsReady &&
-        (displayValue.trim() ||
-          pastedImages.some((img) => img.filePath && !img.error && !img.isLoading) ||
-          allDroppedFiles.some((file) => !file.error && !file.isLoading));
       if (canSubmit) {
         performSubmit();
       }
@@ -1076,8 +1006,6 @@ export default function ChatInput({
     e.preventDefault();
     const canSubmit =
       !isLoading &&
-      !isCompacting &&
-      agentIsReady &&
       (displayValue.trim() ||
         pastedImages.some((img) => img.filePath && !img.error && !img.isLoading) ||
         allDroppedFiles.some((file) => !file.error && !file.isLoading));
@@ -1087,22 +1015,28 @@ export default function ChatInput({
   };
 
   const handleFileSelect = async () => {
-    const path = await window.electron.selectFileOrDirectory();
-    if (path) {
-      const newValue = displayValue.trim() ? `${displayValue.trim()} ${path}` : path;
-      setDisplayValue(newValue);
-      setValue(newValue);
-      textAreaRef.current?.focus();
+    if (isFilePickerOpen) return;
+    setIsFilePickerOpen(true);
+    try {
+      const path = await window.electron.selectFileOrDirectory();
+      if (path) {
+        const newValue = displayValue.trim() ? `${displayValue.trim()} ${path}` : path;
+        setDisplayValue(newValue);
+        setValue(newValue);
+        textAreaRef.current?.focus();
+      }
+    } finally {
+      setIsFilePickerOpen(false);
     }
   };
 
-  const handleMentionFileSelect = (filePath: string) => {
+  const handleMentionItemSelect = (itemText: string) => {
     // Replace the @ mention with the file path
     const beforeMention = displayValue.slice(0, mentionPopover.mentionStart);
     const afterMention = displayValue.slice(
       mentionPopover.mentionStart + 1 + mentionPopover.query.length
     );
-    const newValue = `${beforeMention}${filePath}${afterMention}`;
+    const newValue = `${beforeMention}${itemText}${afterMention}`;
 
     setDisplayValue(newValue);
     setValue(newValue);
@@ -1112,7 +1046,7 @@ export default function ChatInput({
     // Set cursor position after the inserted file path
     setTimeout(() => {
       if (textAreaRef.current) {
-        const newCursorPosition = beforeMention.length + filePath.length;
+        const newCursorPosition = beforeMention.length + itemText.length;
         textAreaRef.current.setSelectionRange(newCursorPosition, newCursorPosition);
       }
     }, 0);
@@ -1124,6 +1058,14 @@ export default function ChatInput({
     allDroppedFiles.some((file) => !file.error && !file.isLoading);
   const isAnyImageLoading = pastedImages.some((img) => img.isLoading);
   const isAnyDroppedFileLoading = allDroppedFiles.some((file) => file.isLoading);
+
+  const isSubmitButtonDisabled =
+    !hasSubmittableContent ||
+    isAnyImageLoading ||
+    isAnyDroppedFileLoading ||
+    isRecording ||
+    isTranscribing ||
+    isExtensionsLoading;
 
   // Queue management functions - no storage persistence, only in-memory
   const handleRemoveQueuedMessage = (messageId: string) => {
@@ -1258,7 +1200,7 @@ export default function ChatInput({
         </div>
 
         {/* Inline action buttons on the right */}
-        <div className="flex items-center gap-1 px-2 relative">
+        <div className="flex items-center gap-1 px-2 relative self-center">
           {/* Microphone button - show only if dictation is enabled */}
           {dictationSettings?.enabled && (
             <>
@@ -1285,7 +1227,8 @@ export default function ChatInput({
                         OpenAI API key is not configured. Set it up in <b>Settings</b> {'>'}{' '}
                         <b>Models.</b>
                       </p>
-                    ) : dictationSettings.provider === 'elevenlabs' ? (
+                    ) : VOICE_DICTATION_ELEVENLABS_ENABLED &&
+                      dictationSettings.provider === 'elevenlabs' ? (
                       <p>
                         ElevenLabs API key is not configured. Set it up in <b>Settings</b> {'>'}{' '}
                         <b>Chat</b> {'>'} <b>Voice Dictation.</b>
@@ -1349,23 +1292,9 @@ export default function ChatInput({
                     size="sm"
                     shape="round"
                     variant="outline"
-                    disabled={
-                      !hasSubmittableContent ||
-                      isAnyImageLoading ||
-                      isAnyDroppedFileLoading ||
-                      isRecording ||
-                      isTranscribing ||
-                      isCompacting ||
-                      !agentIsReady
-                    }
+                    disabled={isSubmitButtonDisabled}
                     className={`rounded-full px-10 py-2 flex items-center gap-2 ${
-                      !hasSubmittableContent ||
-                      isAnyImageLoading ||
-                      isAnyDroppedFileLoading ||
-                      isRecording ||
-                      isTranscribing ||
-                      isCompacting ||
-                      !agentIsReady
+                      isSubmitButtonDisabled
                         ? 'bg-slate-600 text-white cursor-not-allowed opacity-50 border-slate-600'
                         : 'bg-slate-600 text-white hover:bg-slate-700 border-slate-600 hover:cursor-pointer'
                     }`}
@@ -1377,8 +1306,8 @@ export default function ChatInput({
               </TooltipTrigger>
               <TooltipContent>
                 <p>
-                  {isCompacting
-                    ? 'Compacting conversation...'
+                  {isExtensionsLoading
+                    ? 'Loading extensions...'
                     : isAnyImageLoading
                       ? 'Waiting for images to save...'
                       : isAnyDroppedFileLoading
@@ -1387,7 +1316,7 @@ export default function ChatInput({
                           ? 'Recording...'
                           : isTranscribing
                             ? 'Transcribing...'
-                            : (chatContext?.agentWaitingMessage ?? 'Send')}
+                            : 'Send'}
                 </p>
               </TooltipContent>
             </Tooltip>
@@ -1417,7 +1346,7 @@ export default function ChatInput({
 
       {/* Combined files and images preview */}
       {(pastedImages.length > 0 || allDroppedFiles.length > 0) && (
-        <div className="flex flex-wrap gap-2 p-2 border-t border-borderSubtle">
+        <div className="flex flex-wrap gap-2 p-4 mt-2 border-t border-borderSubtle">
           {/* Render pasted images first */}
           {pastedImages.map((img) => (
             <div key={img.id} className="relative group w-20 h-20">
@@ -1530,16 +1459,15 @@ export default function ChatInput({
         {/* Directory path */}
         <DirSwitcher className="mr-0" />
         <div className="w-px h-4 bg-border-default mx-2" />
-
-        {/* Attach button */}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
               type="button"
               onClick={handleFileSelect}
+              disabled={isFilePickerOpen}
               variant="ghost"
               size="sm"
-              className="flex items-center justify-center text-text-default/70 hover:text-text-default text-xs cursor-pointer transition-colors"
+              className={`flex items-center justify-center text-text-default/70 hover:text-text-default text-xs transition-colors ${isFilePickerOpen ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
             >
               <Attach className="w-4 h-4" />
             </Button>
@@ -1547,7 +1475,6 @@ export default function ChatInput({
           <TooltipContent>Attach file or directory</TooltipContent>
         </Tooltip>
         <div className="w-px h-4 bg-border-default mx-2" />
-
         {/* Model selector, mode selector, alerts, summarize button */}
         <div className="flex flex-row items-center">
           {/* Cost Tracker */}
@@ -1555,8 +1482,8 @@ export default function ChatInput({
             <>
               <div className="flex items-center h-full ml-1 mr-1">
                 <CostTracker
-                  inputTokens={inputTokens}
-                  outputTokens={outputTokens}
+                  inputTokens={accumulatedInputTokens}
+                  outputTokens={accumulatedOutputTokens}
                   sessionCosts={sessionCosts}
                 />
               </div>
@@ -1565,39 +1492,79 @@ export default function ChatInput({
           <Tooltip>
             <div>
               <ModelsBottomBar
+                sessionId={sessionId}
                 dropdownRef={dropdownRef}
                 setView={setView}
                 alerts={alerts}
-                recipeConfig={recipeConfig}
-                hasMessages={messages.length > 0}
               />
             </div>
           </Tooltip>
           <div className="w-px h-4 bg-border-default mx-2" />
           <BottomMenuModeSelection />
-          <div className="w-px h-4 bg-border-default mx-2" />
-          <div className="flex items-center h-full">
+          {sessionId && process.env.ALPHA && (
+            <>
+              <div className="w-px h-4 bg-border-default mx-2" />
+              <BottomMenuExtensionSelection sessionId={sessionId} />
+            </>
+          )}
+          {sessionId && messages.length > 0 && (
+            <>
+              <div className="w-px h-4 bg-border-default mx-2" />
+              <div className="flex items-center h-full">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      onClick={() => {
+                        if (recipe) {
+                          setShowEditRecipeModal(true);
+                        } else {
+                          setShowCreateRecipeModal(true);
+                        }
+                      }}
+                      variant="ghost"
+                      size="sm"
+                      className="flex items-center justify-center text-text-default/70 hover:text-text-default text-xs cursor-pointer"
+                    >
+                      <ChefHat size={16} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {recipe ? 'View/Edit Recipe' : 'Create Recipe from Session'}
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            </>
+          )}
+          {sessionId && (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
-                  onClick={() => setIsGoosehintsModalOpen?.(true)}
+                  type="button"
+                  onClick={() => setDiagnosticsOpen(true)}
                   variant="ghost"
                   size="sm"
-                  className="flex items-center justify-center text-text-default/70 hover:text-text-default text-xs cursor-pointer"
+                  className="flex items-center justify-center text-text-default/70 hover:text-text-default text-xs cursor-pointer transition-colors"
                 >
-                  <FolderKey size={16} />
+                  <Bug className="w-4 h-4" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>Configure goosehints</TooltipContent>
+              <TooltipContent>Generate diagnostics bundle</TooltipContent>
             </Tooltip>
-          </div>
+          )}
         </div>
-
+        {sessionId && diagnosticsOpen && (
+          <DiagnosticsModal
+            isOpen={diagnosticsOpen}
+            onClose={() => setDiagnosticsOpen(false)}
+            sessionId={sessionId}
+          />
+        )}
         <MentionPopover
           ref={mentionPopoverRef}
           isOpen={mentionPopover.isOpen}
+          isSlashCommand={mentionPopover.isSlashCommand}
           onClose={() => setMentionPopover((prev) => ({ ...prev, isOpen: false }))}
-          onSelect={handleMentionFileSelect}
+          onSelect={handleMentionItemSelect}
           position={mentionPopover.position}
           query={mentionPopover.query}
           selectedIndex={mentionPopover.selectedIndex}
@@ -1605,6 +1572,23 @@ export default function ChatInput({
             setMentionPopover((prev) => ({ ...prev, selectedIndex: index }))
           }
         />
+
+        {sessionId && showCreateRecipeModal && (
+          <CreateRecipeFromSessionModal
+            isOpen={showCreateRecipeModal}
+            onClose={() => setShowCreateRecipeModal(false)}
+            sessionId={sessionId}
+          />
+        )}
+
+        {recipe && showEditRecipeModal && (
+          <CreateEditRecipeModal
+            isOpen={showEditRecipeModal}
+            onClose={() => setShowEditRecipeModal(false)}
+            recipe={recipe}
+            recipeId={recipeId}
+          />
+        )}
       </div>
     </div>
   );

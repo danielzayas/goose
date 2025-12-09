@@ -1,18 +1,17 @@
-//! Schedule tool handlers for the Goose agent
+//! Schedule tool handlers for the goose agent
 //!
 //! This module contains all the handlers for the schedule management platform tool,
 //! including job creation, execution, monitoring, and session management.
 
 use std::sync::Arc;
 
+use crate::mcp_utils::ToolResult;
 use chrono::Utc;
-use mcp_core::ToolResult;
 use rmcp::model::{Content, ErrorCode, ErrorData};
 
+use super::Agent;
 use crate::recipe::Recipe;
 use crate::scheduler_trait::SchedulerTrait;
-
-use super::Agent;
 
 impl Agent {
     /// Handle schedule management tool calls
@@ -62,34 +61,24 @@ impl Agent {
         }
     }
 
-    /// List all scheduled jobs
     async fn handle_list_jobs(
         &self,
         scheduler: Arc<dyn SchedulerTrait>,
     ) -> ToolResult<Vec<Content>> {
-        match scheduler.list_scheduled_jobs().await {
-            Ok(jobs) => {
-                let jobs_json = serde_json::to_string_pretty(&jobs).map_err(|e| {
-                    ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        format!("Failed to serialize jobs: {}", e),
-                        None,
-                    )
-                })?;
-                Ok(vec![Content::text(format!(
-                    "Scheduled Jobs:\n{}",
-                    jobs_json
-                ))])
-            }
-            Err(e) => Err(ErrorData::new(
+        let jobs = scheduler.list_scheduled_jobs().await;
+        let jobs_json = serde_json::to_string_pretty(&jobs).map_err(|e| {
+            ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
-                format!("Failed to list jobs: {}", e),
+                format!("Failed to serialize jobs: {}", e),
                 None,
-            )),
-        }
+            )
+        })?;
+        Ok(vec![Content::text(format!(
+            "Scheduled Jobs:\n{}",
+            jobs_json
+        ))])
     }
 
-    /// Create a new scheduled job from a recipe file
     async fn handle_create_job(
         &self,
         scheduler: Arc<dyn SchedulerTrait>,
@@ -123,19 +112,6 @@ impl Agent {
             .and_then(|v| v.as_str())
             .unwrap_or("background");
 
-        // Validate execution_mode is either "foreground" or "background"
-        if execution_mode != "foreground" && execution_mode != "background" {
-            return Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!(
-                    "Invalid execution_mode: {}. Must be 'foreground' or 'background'",
-                    execution_mode
-                ),
-                None,
-            ));
-        }
-
-        // Validate recipe file exists and is readable
         if !std::path::Path::new(recipe_path).exists() {
             return Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
@@ -186,10 +162,9 @@ impl Agent {
             paused: false,
             current_session_id: None,
             process_start_time: None,
-            execution_mode: Some(execution_mode.to_string()),
         };
 
-        match scheduler.add_scheduled_job(job).await {
+        match scheduler.add_scheduled_job(job, true).await {
             Ok(()) => Ok(vec![Content::text(format!(
                 "Successfully created scheduled job '{}' for recipe '{}' with cron expression '{}' in {} mode",
                 job_id, recipe_path, cron_expression, execution_mode
@@ -309,7 +284,7 @@ impl Agent {
                 )
             })?;
 
-        match scheduler.remove_scheduled_job(job_id).await {
+        match scheduler.remove_scheduled_job(job_id, true).await {
             Ok(()) => Ok(vec![Content::text(format!(
                 "Successfully deleted job '{}'",
                 job_id
@@ -421,12 +396,12 @@ impl Agent {
                 } else {
                     let sessions_info: Vec<String> = sessions
                         .into_iter()
-                        .map(|(session_name, metadata)| {
+                        .map(|(session_name, session)| {
                             format!(
                                 "- Session: {} (Messages: {}, Working Dir: {})",
                                 session_name,
-                                metadata.message_count,
-                                metadata.working_dir.display()
+                                session.conversation.unwrap_or_default().len(),
+                                session.working_dir.display()
                             )
                         })
                         .collect();
@@ -462,55 +437,19 @@ impl Agent {
                 )
             })?;
 
-        // Get the session file path
-        let session_path = match crate::session::storage::get_path(
-            crate::session::storage::Identifier::Name(session_id.to_string()),
-        ) {
-            Ok(path) => path,
-            Err(e) => {
-                return Err(ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Invalid session ID '{}': {}", session_id, e),
-                    None,
-                ));
-            }
-        };
-
-        // Check if session file exists
-        if !session_path.exists() {
-            return Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Session '{}' not found", session_id),
-                None,
-            ));
-        }
-
-        // Read session metadata
-        let metadata = match crate::session::storage::read_metadata(&session_path) {
+        let session = match crate::session::SessionManager::get_session(session_id, true).await {
             Ok(metadata) => metadata,
             Err(e) => {
                 return Err(ErrorData::new(
                     ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to read session metadata: {}", e),
-                    None,
-                ));
-            }
-        };
-
-        // Read session messages
-        let messages = match crate::session::storage::read_messages(&session_path) {
-            Ok(messages) => messages,
-            Err(e) => {
-                return Err(ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to read session messages: {}", e),
+                    format!("Failed to read session for '{}': {}", session_id, e),
                     None,
                 ));
             }
         };
 
         // Format the response with metadata and messages
-        let metadata_json = match serde_json::to_string_pretty(&metadata) {
+        let metadata_json = match serde_json::to_string_pretty(&session) {
             Ok(json) => json,
             Err(e) => {
                 return Err(ErrorData::new(
@@ -521,20 +460,9 @@ impl Agent {
             }
         };
 
-        let messages_json = match serde_json::to_string_pretty(&messages) {
-            Ok(json) => json,
-            Err(e) => {
-                return Err(ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("Failed to serialize messages: {}", e),
-                    None,
-                ));
-            }
-        };
-
         Ok(vec![Content::text(format!(
-            "Session '{}' Content:\n\nMetadata:\n{}\n\nMessages:\n{}",
-            session_id, metadata_json, messages_json
+            "Session '{}' Content:\n\nSession:\n{}",
+            session_id, metadata_json
         ))])
     }
 }

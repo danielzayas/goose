@@ -1,7 +1,7 @@
 name: Recipe Security Scan
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
     paths:
       - 'documentation/src/pages/recipes/data/recipes/**'
@@ -13,6 +13,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
   statuses: write
 
 jobs:
@@ -42,9 +43,9 @@ jobs:
             echo "📝 Synchronize event - checking files changed since previous commit"
             CHANGED_FILES=$(git diff --name-only --diff-filter=AM ${{ github.event.before }}..${{ github.event.after }})
           else
-            # For opened/reopened, check all files in the PR
+            # For opened/reopened, check all files in the PR (compare PR head against base)
             echo "📝 PR opened/reopened - checking all files in PR"
-            CHANGED_FILES=$(git diff --name-only --diff-filter=AM origin/${{ github.base_ref }}..HEAD)
+            CHANGED_FILES=$(git diff --name-only --diff-filter=AM ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }})
           fi
           
           echo "Changed files in this push:"
@@ -77,9 +78,9 @@ jobs:
             echo "📝 Synchronize event - checking files changed/added since previous commit"
             CHANGED_FILES=$(git diff --name-only --diff-filter=AM ${{ github.event.before }}..${{ github.event.after }})
           else
-            # For opened/reopened, check all files in the PR (new and modified)
+            # For opened/reopened, check all files in the PR (compare PR head against base)
             echo "📝 PR opened/reopened - checking all new/modified files in PR"
-            CHANGED_FILES=$(git diff --name-only --diff-filter=AM origin/${{ github.base_ref }}..HEAD)
+            CHANGED_FILES=$(git diff --name-only --diff-filter=AM ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }})
           fi
           
           # Filter for recipe files only that were changed or added
@@ -139,6 +140,12 @@ jobs:
           mkdir -p "$OUT"
           # Set permissions for Docker container (scanner user is UID 1000)
           sudo chmod -R 777 "$OUT" || true
+          
+          # Verify secrets are available (without logging details)
+          if [ -z "$OPENAI_API_KEY" ] || [ -z "$TRAINING_DATA_LOW" ] || [ -z "$TRAINING_DATA_MEDIUM" ] || [ -z "$TRAINING_DATA_EXTREME" ]; then
+            echo "❌ One or more required secrets are missing or inaccessible"
+            exit 1
+          fi
           
           # Initialize overall scan results
           echo '{"scanned_recipes": [], "overall_status": "UNKNOWN", "failed_scans": 0}' > "$OUT/pr_scan_summary.json"

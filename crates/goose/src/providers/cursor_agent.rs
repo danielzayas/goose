@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::Role;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -9,131 +10,61 @@ use tokio::process::Command;
 
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
-use super::utils::emit_debug_trace;
+use super::utils::{filter_extensions_from_system_prompt, RequestLog};
+use crate::config::base::CursorAgentCommand;
+use crate::config::search_path::SearchPaths;
 use crate::conversation::message::{Message, MessageContent};
-use crate::impl_provider_default;
 use crate::model::ModelConfig;
+use crate::subprocess::configure_command_no_window;
 use rmcp::model::Tool;
 
-pub const CURSOR_AGENT_DEFAULT_MODEL: &str = "gpt-5";
-pub const CURSOR_AGENT_KNOWN_MODELS: &[&str] = &["gpt-5", "opus-4.1", "sonnet-4"];
+pub const CURSOR_AGENT_DEFAULT_MODEL: &str = "auto";
+pub const CURSOR_AGENT_KNOWN_MODELS: &[&str] = &["auto", "gpt-5", "opus-4.1", "sonnet-4"];
 
 pub const CURSOR_AGENT_DOC_URL: &str = "https://docs.cursor.com/en/cli/overview";
 
 #[derive(Debug, serde::Serialize)]
 pub struct CursorAgentProvider {
-    command: String,
+    command: PathBuf,
     model: ModelConfig,
+    #[serde(skip)]
+    name: String,
 }
 
-impl_provider_default!(CursorAgentProvider);
-
 impl CursorAgentProvider {
-    pub fn from_env(model: ModelConfig) -> Result<Self> {
+    pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
-        let command: String = config
-            .get_param("CURSOR_AGENT_COMMAND")
-            .unwrap_or_else(|_| "cursor-agent".to_string());
-
-        let resolved_command = if !command.contains('/') {
-            Self::find_cursor_agent_executable(&command).unwrap_or(command)
-        } else {
-            command
-        };
+        let command: OsString = config.get_cursor_agent_command().unwrap_or_default().into();
+        let resolved_command = SearchPaths::builder().with_npm().resolve(command)?;
 
         Ok(Self {
             command: resolved_command,
             model,
+            name: Self::metadata().name,
         })
     }
 
-    /// Search for cursor-agent executable in common installation locations
-    fn find_cursor_agent_executable(command_name: &str) -> Option<String> {
-        let home = std::env::var("HOME").ok()?;
-
-        let search_paths = vec![
-            format!("/opt/homebrew/bin/{}", command_name),
-            format!("/usr/bin/{}", command_name),
-            format!("/usr/local/bin/{}", command_name),
-            format!("{}/.local/bin/{}", home, command_name),
-            format!("{}/bin/{}", home, command_name),
-        ];
-
-        for path in search_paths {
-            let path_buf = PathBuf::from(&path);
-            if path_buf.exists() && path_buf.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = std::fs::metadata(&path_buf) {
-                        let permissions = metadata.permissions();
-                        if permissions.mode() & 0o111 != 0 {
-                            tracing::info!("Found cursor-agent executable at: {}", path);
-                            return Some(path);
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    tracing::info!("Found cursor-agent executable at: {}", path);
-                    return Some(path);
-                }
-            }
-        }
-
-        if let Ok(path_var) = std::env::var("PATH") {
-            #[cfg(unix)]
-            let path_separator = ':';
-            #[cfg(windows)]
-            let path_separator = ';';
-
-            for dir in path_var.split(path_separator) {
-                let path_buf = PathBuf::from(dir).join(command_name);
-                if path_buf.exists() && path_buf.is_file() {
-                    let full_path = path_buf.to_string_lossy().to_string();
-                    tracing::info!("Found cursor-agent executable in PATH at: {}", full_path);
-                    return Some(full_path);
-                }
-            }
-        }
-
-        tracing::warn!("Could not find cursor-agent executable in common locations");
-        None
-    }
-
-    /// Filter out the Extensions section from the system prompt
-    fn filter_extensions_from_system_prompt(&self, system: &str) -> String {
-        // Find the Extensions section and remove it
-        if let Some(extensions_start) = system.find("# Extensions") {
-            // Look for the next major section that starts with #
-            let after_extensions = &system[extensions_start..];
-            if let Some(next_section_pos) = after_extensions[1..].find("\n# ") {
-                // Found next section, keep everything before Extensions and after the next section
-                let before_extensions = &system[..extensions_start];
-                let next_section_start = extensions_start + next_section_pos + 1;
-                let after_next_section = &system[next_section_start..];
-                format!("{}{}", before_extensions.trim_end(), after_next_section)
-            } else {
-                // No next section found, just remove everything from Extensions onward
-                system[..extensions_start].trim_end().to_string()
-            }
-        } else {
-            // No Extensions section found, return original
-            system.to_string()
-        }
+    /// Get authentication status from cursor-agent
+    async fn get_authentication_status(&self) -> bool {
+        Command::new(&self.command)
+            .arg("status")
+            .output()
+            .await
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("✓ Logged in as"))
+            .unwrap_or(false)
     }
 
     /// Convert goose messages to a simple prompt format for cursor-agent CLI
     fn messages_to_cursor_agent_format(&self, system: &str, messages: &[Message]) -> String {
         let mut full_prompt = String::new();
 
-        // Add system prompt
-        let filtered_system = self.filter_extensions_from_system_prompt(system);
+        let filtered_system = filter_extensions_from_system_prompt(system);
         full_prompt.push_str(&filtered_system);
         full_prompt.push_str("\n\n");
 
         // Add conversation history
-        for message in messages {
+        for message in messages.iter().filter(|m| m.is_agent_visible()) {
             let role_prefix = match message.role {
                 Role::User => "Human: ",
                 Role::Assistant => "Assistant: ",
@@ -149,7 +80,7 @@ impl CursorAgentProvider {
                     MessageContent::ToolRequest(tool_request) => {
                         if let Ok(tool_call) = &tool_request.tool_call {
                             full_prompt.push_str(&format!(
-                                "Tool Use: {} with args: {}\n",
+                                "Tool Use: {} with args: {:?}\n",
                                 tool_call.name, tool_call.arguments
                             ));
                         }
@@ -214,12 +145,11 @@ impl CursorAgentProvider {
                         };
 
                         let message_content = vec![MessageContent::text(text_content)];
-                        let response_message = Message {
-                            id: None,
-                            role: Role::Assistant,
-                            created: chrono::Utc::now().timestamp(),
-                            content: message_content,
-                        };
+                        let response_message = Message::new(
+                            Role::Assistant,
+                            chrono::Utc::now().timestamp(),
+                            message_content,
+                        );
 
                         let usage = Usage::default();
 
@@ -233,12 +163,11 @@ impl CursorAgentProvider {
         let response_text = lines.join("\n");
 
         let message_content = vec![MessageContent::text(response_text)];
-        let response_message = Message {
-            id: None,
-            role: Role::Assistant,
-            created: chrono::Utc::now().timestamp(),
-            content: message_content,
-        };
+        let response_message = Message::new(
+            Role::Assistant,
+            chrono::Utc::now().timestamp(),
+            message_content,
+        );
         let usage = Usage::default();
 
         Ok((response_message, usage))
@@ -254,11 +183,11 @@ impl CursorAgentProvider {
 
         if std::env::var("GOOSE_CURSOR_AGENT_DEBUG").is_ok() {
             println!("=== CURSOR AGENT PROVIDER DEBUG ===");
-            println!("Command: {}", self.command);
+            println!("Command: {:?}", self.command);
             println!("Original system prompt length: {} chars", system.len());
             println!(
                 "Filtered system prompt length: {} chars",
-                self.filter_extensions_from_system_prompt(system).len()
+                filter_extensions_from_system_prompt(system).len()
             );
             println!("Full prompt: {}", prompt);
             println!("Model: {}", self.model.model_name);
@@ -266,10 +195,15 @@ impl CursorAgentProvider {
         }
 
         let mut cmd = Command::new(&self.command);
+        configure_command_no_window(&mut cmd);
+
+        if let Ok(path) = SearchPaths::builder().with_npm().path() {
+            cmd.env("PATH", path);
+        }
 
         // Only pass model parameter if it's in the known models list
         if CURSOR_AGENT_KNOWN_MODELS.contains(&self.model.model_name.as_str()) {
-            cmd.arg("-m").arg(&self.model.model_name);
+            cmd.arg("--model").arg(&self.model.model_name);
         }
 
         cmd.arg("-p")
@@ -283,8 +217,8 @@ impl CursorAgentProvider {
         let mut child = cmd
                 .spawn()
                 .map_err(|e| ProviderError::RequestFailed(format!(
-                    "Failed to spawn cursor-agent CLI command '{}': {}. \
-                    Make sure the cursor-agent CLI is installed and in your PATH, or set CURSOR_AGENT_COMMAND in your config to the correct path.",
+                    "Failed to spawn cursor-agent CLI command '{:?}': {}. \
+                    Make sure the cursor-agent CLI is installed and available in the configured search paths, or set CURSOR_AGENT_COMMAND in your config to the correct path.",
                     self.command, e
                 )))?;
 
@@ -321,6 +255,11 @@ impl CursorAgentProvider {
         })?;
 
         if !exit_status.success() {
+            if !self.get_authentication_status().await {
+                return Err(ProviderError::Authentication(
+                    "You are not logged in to cursor-agent. Please run 'cursor-agent login' to authenticate first."
+                        .to_string()));
+            }
             return Err(ProviderError::RequestFailed(format!(
                 "Command failed with exit code: {:?}",
                 exit_status.code()
@@ -366,12 +305,11 @@ impl CursorAgentProvider {
             println!("================================");
         }
 
-        let message = Message {
-            id: None,
-            role: Role::Assistant,
-            created: chrono::Utc::now().timestamp(),
-            content: vec![MessageContent::text(description.clone())],
-        };
+        let message = Message::new(
+            Role::Assistant,
+            chrono::Utc::now().timestamp(),
+            vec![MessageContent::text(description.clone())],
+        );
 
         let usage = Usage::default();
 
@@ -392,13 +330,14 @@ impl Provider for CursorAgentProvider {
             CURSOR_AGENT_DEFAULT_MODEL,
             CURSOR_AGENT_KNOWN_MODELS.to_vec(),
             CURSOR_AGENT_DOC_URL,
-            vec![ConfigKey::new(
-                "CURSOR_AGENT_COMMAND",
-                false,
-                false,
-                Some("cursor-agent"),
+            vec![ConfigKey::from_value_type::<CursorAgentCommand>(
+                true, false,
             )],
         )
+    }
+
+    fn get_name(&self) -> &str {
+        &self.name
     }
 
     fn get_model_config(&self) -> ModelConfig {
@@ -439,60 +378,12 @@ impl Provider for CursorAgentProvider {
             "usage": usage
         });
 
-        emit_debug_trace(model_config, &payload, &response, &usage);
+        let mut log = RequestLog::start(&self.model, &payload)?;
+        log.write(&response, Some(&usage))?;
 
         Ok((
             message,
             ProviderUsage::new(model_config.model_name.clone(), usage),
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ModelConfig;
-    use super::*;
-
-    #[test]
-    fn test_cursor_agent_model_config() {
-        let provider = CursorAgentProvider::default();
-        let config = provider.get_model_config();
-
-        assert_eq!(config.model_name, "gpt-5");
-        // Context limit should be set by the ModelConfig
-        assert!(config.context_limit() > 0);
-    }
-
-    #[test]
-    fn test_cursor_agent_invalid_model_no_fallback() {
-        // Test that an invalid model is kept as-is (no fallback)
-        let invalid_model = ModelConfig::new_or_fail("invalid-model");
-        let provider = CursorAgentProvider::from_env(invalid_model).unwrap();
-        let config = provider.get_model_config();
-
-        assert_eq!(config.model_name, "invalid-model");
-    }
-
-    #[test]
-    fn test_cursor_agent_valid_model() {
-        // Test that a valid model is preserved
-        let valid_model = ModelConfig::new_or_fail("gpt-5");
-        let provider = CursorAgentProvider::from_env(valid_model).unwrap();
-        let config = provider.get_model_config();
-
-        assert_eq!(config.model_name, "gpt-5");
-    }
-
-    #[test]
-    fn test_filter_extensions_from_system_prompt() {
-        let provider = CursorAgentProvider::default();
-
-        let system_with_extensions = "Some system prompt\n\n# Extensions\nSome extension info\n\n# Next Section\nMore content";
-        let filtered = provider.filter_extensions_from_system_prompt(system_with_extensions);
-        assert_eq!(filtered, "Some system prompt\n# Next Section\nMore content");
-
-        let system_without_extensions = "Some system prompt\n\n# Other Section\nContent";
-        let filtered = provider.filter_extensions_from_system_prompt(system_without_extensions);
-        assert_eq!(filtered, system_without_extensions);
     }
 }

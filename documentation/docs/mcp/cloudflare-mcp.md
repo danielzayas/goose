@@ -1,23 +1,23 @@
 ---
 title: Cloudflare Extension
-description: Add Cloudflare MCP Servers as Goose Extensions
+description: Add Cloudflare MCP Servers as goose Extensions
 unlisted: true
 ---
 
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-This tutorial covers how to add [Cloudflare's MCP Servers](https://github.com/cloudflare/mcp-server-cloudflare) as Goose extensions to manage your Cloudflare infrastructure, debug applications, analyze traffic, and more using natural language.
+This tutorial covers how to add [Cloudflare's MCP Servers](https://github.com/cloudflare/mcp-server-cloudflare) as goose extensions to manage your Cloudflare infrastructure, debug applications, analyze traffic, and more using natural language.
 
 Cloudflare provides multiple specialized MCP servers for different aspects of their platform, allowing you to interact with Workers, DNS, security features, analytics, and development tools.
 
 :::tip TLDR
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   [Launch the installer](goose://extension?cmd=npx&arg=mcp-remote&arg=https%3A%2F%2Fobservability.mcp.cloudflare.com%2Fsse&id=cloudflare-observability&name=Cloudflare%20Observability&description=Debug%20and%20get%20insight%20into%20your%20application%27s%20logs%20and%20analytics&env=CLOUDFLARE_API_TOKEN%3DCloudflare%20API%20Token)
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   **Command**
   ```sh
   npx mcp-remote https://observability.mcp.cloudflare.com/sse
@@ -72,21 +72,21 @@ Cloudflare provides multiple specialized MCP servers for different use cases:
    - **Workers:Read/Edit** - For Workers-related servers
    - **Logs:Read** - For observability and audit logs
 
-### Step 2: Add MCP Server to Goose
+### Step 2: Add MCP Server to goose
 
 Choose one or more servers based on your needs. Here are the most popular configurations:
 
 #### Observability Server (Recommended for debugging)
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   1. [Launch the installer](goose://extension?cmd=npx&arg=mcp-remote&arg=https%3A%2F%2Fobservability.mcp.cloudflare.com%2Fsse&id=cloudflare-observability&name=Cloudflare%20Observability&description=Debug%20and%20get%20insight%20into%20your%20application%27s%20logs%20and%20analytics&env=CLOUDFLARE_API_TOKEN%3DCloudflare%20API%20Token)
   2. Press `Yes` to confirm the installation
   3. Enter your Cloudflare API Token
   4. Click `Save Configuration`
   5. Scroll to the top and click `Exit` from the upper left corner
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   1. Run the `configure` command:
   ```sh
   goose configure
@@ -106,10 +106,10 @@ Choose one or more servers based on your needs. Here are the most popular config
 #### Workers Bindings Server (For Workers development)
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   [Launch the installer](goose://extension?cmd=npx&arg=mcp-remote&arg=https%3A%2F%2Fbindings.mcp.cloudflare.com%2Fsse&id=cloudflare-bindings&name=Cloudflare%20Workers%20Bindings&description=Build%20Workers%20applications%20with%20storage%2C%20AI%2C%20and%20compute%20primitives&env=CLOUDFLARE_API_TOKEN%3DCloudflare%20API%20Token)
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   Command: `npx mcp-remote https://bindings.mcp.cloudflare.com/sse`
   </TabItem>
 </Tabs>
@@ -117,10 +117,10 @@ Choose one or more servers based on your needs. Here are the most popular config
 #### Radar Server (For traffic insights)
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   [Launch the installer](goose://extension?cmd=npx&arg=mcp-remote&arg=https%3A%2F%2Fradar.mcp.cloudflare.com%2Fsse&id=cloudflare-radar&name=Cloudflare%20Radar&description=Get%20global%20Internet%20traffic%20insights%2C%20trends%2C%20URL%20scans%2C%20and%20other%20utilities&env=CLOUDFLARE_API_TOKEN%3DCloudflare%20API%20Token)
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
   Command: `npx mcp-remote https://radar.mcp.cloudflare.com/sse`
   </TabItem>
 </Tabs>
@@ -132,10 +132,10 @@ Choose one or more servers based on your needs. Here are the most popular config
 Let's use the Observability server to debug performance issues with a Workers application:
 
 :::info LLM
-Anthropic's Claude 3.5 Sonnet was used for this task.
+Anthropic's Claude 4 Sonnet was used for this task.
 :::
 
-#### Goose Prompt
+#### goose Prompt
 ```
 I'm seeing high error rates on my Workers application "my-api-worker". Can you help me:
 1. Check the recent error logs
@@ -144,13 +144,13 @@ I'm seeing high error rates on my Workers application "my-api-worker". Can you h
 4. Suggest optimizations based on the data
 ```
 
-#### Expected Goose Output
+#### Expected goose Output
 ```
 I'll help you debug the issues with your "my-api-worker" application. Let me gather the observability data to identify the problems.
 
 First, let me check the recent error logs for your worker:
 
-[Goose uses the observability MCP server to fetch error logs]
+[goose uses the observability MCP server to fetch error logs]
 
 I found several issues with your worker:
 
@@ -182,7 +182,7 @@ Would you like me to help implement any of these fixes?
 
 Using the Workers Bindings server to set up storage and AI capabilities:
 
-#### Goose Prompt
+#### goose Prompt
 ```
 I need to set up a new Workers project with:
 1. KV storage for caching
@@ -197,7 +197,7 @@ Can you help me configure these bindings?
 
 Using the Radar server for security and traffic analysis:
 
-#### Goose Prompt
+#### goose Prompt
 ```
 Can you help me analyze the security posture of my domain example.com? I want to:
 1. Check for any security threats or malicious traffic
@@ -278,12 +278,12 @@ If you encounter issues:
 
 1. Check the [Cloudflare MCP Server repository](https://github.com/cloudflare/mcp-server-cloudflare) for documentation
 2. Review [Cloudflare API documentation](https://developers.cloudflare.com/api/)
-3. Join our [Discord community](https://discord.gg/block-opensource) for support
+3. Join our [Discord community](https://discord.gg/goose-oss) for support
 4. Check [Cloudflare Community](https://community.cloudflare.com/) for platform-specific help
 
 ## Next Steps
 
-With Cloudflare MCP servers enabled in Goose, you can:
+With Cloudflare MCP servers enabled in goose, you can:
 
 - **Monitor and debug** your applications with natural language queries
 - **Manage infrastructure** through conversational commands

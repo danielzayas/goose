@@ -10,10 +10,12 @@ import {
   MenuItem,
   Notification,
   powerSaveBlocker,
+  screen,
   session,
   shell,
   Tray,
 } from 'electron';
+import { pathToFileURL, format as formatUrl, URLSearchParams } from 'node:url';
 import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
@@ -22,9 +24,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'child_process';
 import 'dotenv/config';
-import { startGoosed } from './goosed';
-import { expandTilde, getBinaryPath } from './utils/pathUtils';
-import { loadShellEnv } from './utils/loadEnv';
+import { checkServerStatus, startGoosed } from './goosed';
+import { expandTilde } from './utils/pathUtils';
 import log from './utils/logger';
 import { ensureWinShims } from './utils/winShims';
 import { addRecentDir, loadRecentDirs } from './utils/recentDirs';
@@ -32,9 +33,7 @@ import {
   EnvToggles,
   loadSettings,
   saveSettings,
-  SchedulingEngine,
   updateEnvironmentVariables,
-  updateSchedulingEngineEnvironment,
 } from './utils/settings';
 import * as crypto from 'crypto';
 // import electron from "electron";
@@ -48,35 +47,9 @@ import {
   updateTrayMenu,
 } from './utils/autoUpdater';
 import { UPDATES_ENABLED } from './updates';
-import { Recipe } from './recipe';
 import './utils/recipeHash';
-
-// API URL constructor for main process before window is ready
-function getApiUrlMain(endpoint: string, dynamicPort: number): string {
-  const host = process.env.GOOSE_API_HOST || 'http://127.0.0.1';
-  const port = dynamicPort || process.env.GOOSE_PORT;
-  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
-  return `${host}:${port}${cleanEndpoint}`;
-}
-
-// When opening the app with a deeplink, the window is still initializing so we have to duplicate some window dependant logic here.
-async function decodeRecipeMain(deeplink: string, port: number): Promise<Recipe | null> {
-  try {
-    const response = await fetch(getApiUrlMain('/recipes/decode', port), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deeplink }),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      return data.recipe;
-    }
-  } catch {
-    console.error('Failed to decode recipe');
-  }
-  return null;
-}
+import { Client, createClient, createConfig } from './api/client';
+import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-installer';
 
 // Updater functions (moved here to keep updates.ts minimal for release replacement)
 function shouldSetupUpdater(): boolean {
@@ -161,6 +134,11 @@ async function ensureTempDirExists(): Promise<string> {
 
 if (started) app.quit();
 
+if (process.env.ENABLE_PLAYWRIGHT) {
+  console.log('[Main] Enabling Playwright remote debugging on port 9222');
+  app.commandLine.appendSwitch('remote-debugging-port', '9222');
+}
+
 // In development mode, force registration as the default protocol client
 // In production, register normally
 if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -184,9 +162,10 @@ if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
   app.setAsDefaultProtocolClient('goose');
 }
 
-// Only apply single instance lock on Windows where it's needed for deep links
+// Apply single instance lock on Windows and Linux where it's needed for deep links
+// macOS uses the 'open-url' event instead
 let gotTheLock = true;
-if (process.platform === 'win32') {
+if (process.platform !== 'darwin') {
   gotTheLock = app.requestSingleInstanceLock();
 
   if (!gotTheLock) {
@@ -202,7 +181,7 @@ if (process.platform === 'win32') {
             const recentDirs = loadRecentDirs();
             const openDir = recentDirs.length > 0 ? recentDirs[0] : null;
 
-            const recipeDeeplink = parsedUrl.searchParams.get('config');
+            const deeplinkData = parseRecipeDeeplink(protocolUrl);
             const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
 
             createChat(
@@ -212,9 +191,10 @@ if (process.platform === 'win32') {
               undefined,
               undefined,
               undefined,
+              deeplinkData?.config,
+              scheduledJobId || undefined,
               undefined,
-              recipeDeeplink || undefined,
-              scheduledJobId || undefined
+              deeplinkData?.parameters
             );
           });
           return; // Skip the rest of the handler
@@ -236,7 +216,7 @@ if (process.platform === 'win32') {
     });
   }
 
-  // Handle protocol URLs on Windows startup
+  // Handle protocol URLs on Windows and Linux startup
   const protocolUrl = process.argv.find((arg) => arg.startsWith('goose://'));
   if (protocolUrl) {
     app.whenReady().then(() => {
@@ -300,7 +280,7 @@ async function processProtocolUrl(parsedUrl: URL, window: BrowserWindow) {
   } else if (parsedUrl.hostname === 'sessions') {
     window.webContents.send('open-shared-session', pendingDeepLink);
   } else if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
-    const recipeDeeplink = parsedUrl.searchParams.get('config');
+    const deeplinkData = parseRecipeDeeplink(pendingDeepLink ?? parsedUrl.toString());
     const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
 
     // Create a new window and ignore the passed-in window
@@ -311,13 +291,16 @@ async function processProtocolUrl(parsedUrl: URL, window: BrowserWindow) {
       undefined,
       undefined,
       undefined,
+      deeplinkData?.config,
+      scheduledJobId || undefined,
       undefined,
-      recipeDeeplink || undefined,
-      scheduledJobId || undefined
+      deeplinkData?.parameters
     );
+    pendingDeepLink = null;
   }
-  pendingDeepLink = null;
 }
+
+let windowDeeplinkURL: string | null = null;
 
 app.on('open-url', async (_event, url) => {
   if (process.platform !== 'win32') {
@@ -329,7 +312,10 @@ app.on('open-url', async (_event, url) => {
     console.log('[Main] Received open-url event:', url);
     if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
       console.log('[Main] Detected bot/recipe URL, creating new chat window');
-      const recipeDeeplink = parsedUrl.searchParams.get('config');
+      const deeplinkData = parseRecipeDeeplink(url);
+      if (deeplinkData) {
+        windowDeeplinkURL = url;
+      }
       const scheduledJobId = parsedUrl.searchParams.get('scheduledJob');
 
       // Create a new window directly
@@ -340,10 +326,12 @@ app.on('open-url', async (_event, url) => {
         undefined,
         undefined,
         undefined,
+        deeplinkData?.config,
+        scheduledJobId || undefined,
         undefined,
-        recipeDeeplink || undefined,
-        scheduledJobId || undefined
+        deeplinkData?.parameters
       );
+      windowDeeplinkURL = null;
       return; // Skip the rest of the handler
     }
 
@@ -421,8 +409,8 @@ async function handleFileOpen(filePath: string) {
       newWindow.focus();
       newWindow.moveTop();
     }
-  } catch {
-    console.error('Failed to handle file open');
+  } catch (error) {
+    console.error('Failed to handle file open:', error);
 
     // Show user-friendly error notification
     new Notification({
@@ -440,9 +428,10 @@ let envToggles: EnvToggles = loadSettings().envToggles;
 
 // Parse command line arguments
 const parseArgs = () => {
-  const args = process.argv.slice(2); // Remove first two elements (electron and script path)
   let dirPath = null;
 
+  // Remove first two elements in dev mode (electron and script path)
+  const args = !dirPath && app.isPackaged ? process.argv : process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--dir' && i + 1 < args.length) {
       dirPath = args[i + 1];
@@ -453,46 +442,37 @@ const parseArgs = () => {
   return { dirPath };
 };
 
-const getGooseProvider = () => {
-  loadShellEnv(app.isPackaged);
+interface BundledConfig {
+  defaultProvider?: string;
+  defaultModel?: string;
+  predefinedModels?: string;
+  baseUrlShare?: string;
+  version?: string;
+}
+
+const getBundledConfig = (): BundledConfig => {
   //{env-macro-start}//
   //needed when goose is bundled for a specific provider
   //{env-macro-end}//
-  return [
-    process.env.GOOSE_DEFAULT_PROVIDER,
-    process.env.GOOSE_DEFAULT_MODEL,
-    process.env.GOOSE_PREDEFINED_MODELS,
-  ];
+  return {
+    defaultProvider: process.env.GOOSE_DEFAULT_PROVIDER,
+    defaultModel: process.env.GOOSE_DEFAULT_MODEL,
+    predefinedModels: process.env.GOOSE_PREDEFINED_MODELS,
+    baseUrlShare: process.env.GOOSE_BASE_URL_SHARE,
+    version: process.env.GOOSE_VERSION,
+  };
 };
 
-const getSharingUrl = () => {
-  // checks app env for sharing url
-  loadShellEnv(app.isPackaged); // will try to take it from the zshrc file
-  // if GOOSE_BASE_URL_SHARE is found, we will set process.env.GOOSE_BASE_URL_SHARE, otherwise we return what it is set
-  // to in the env at bundle time
-  return process.env.GOOSE_BASE_URL_SHARE;
-};
-
-const getVersion = () => {
-  // checks app env for sharing url
-  loadShellEnv(app.isPackaged); // will try to take it from the zshrc file
-  // to in the env at bundle time
-  return process.env.GOOSE_VERSION;
-};
-
-const [provider, model, predefinedModels] = getGooseProvider();
-
-const sharingUrl = getSharingUrl();
-
-const gooseVersion = getVersion();
+const { defaultProvider, defaultModel, predefinedModels, baseUrlShare, version } =
+  getBundledConfig();
 
 const SERVER_SECRET = process.env.GOOSE_EXTERNAL_BACKEND
   ? 'test'
   : crypto.randomBytes(32).toString('hex');
 
 let appConfig = {
-  GOOSE_DEFAULT_PROVIDER: provider,
-  GOOSE_DEFAULT_MODEL: model,
+  GOOSE_DEFAULT_PROVIDER: defaultProvider,
+  GOOSE_DEFAULT_MODEL: defaultModel,
   GOOSE_PREDEFINED_MODELS: predefinedModels,
   GOOSE_API_HOST: 'http://127.0.0.1',
   GOOSE_PORT: 0,
@@ -501,84 +481,40 @@ let appConfig = {
   GOOSE_ALLOWLIST_WARNING: process.env.GOOSE_ALLOWLIST_WARNING === 'true',
 };
 
-// Track windows by ID
-let windowCounter = 0;
 const windowMap = new Map<number, BrowserWindow>();
+const goosedClients = new Map<number, Client>();
 
 // Track power save blockers per window
 const windowPowerSaveBlockers = new Map<number, number>(); // windowId -> blockerId
+// Track pending initial messages per window
+const pendingInitialMessages = new Map<number, string>(); // windowId -> initialMessage
 
 const createChat = async (
   app: App,
-  query?: string,
+  initialMessage?: string,
   dir?: string,
   _version?: string,
   resumeSessionId?: string,
-  recipe?: Recipe, // Recipe configuration when already loaded, takes precedence over deeplink
   viewType?: string,
-  recipeDeeplink?: string, // Raw deeplink used as a fallback when recipe is not loaded. Required on new windows as we need to wait for the window to load before decoding.
-  scheduledJobId?: string // Scheduled job ID if applicable
+  recipeDeeplink?: string, // Raw deeplink decoded on server
+  scheduledJobId?: string, // Scheduled job ID if applicable
+  recipeId?: string,
+  recipeParameters?: Record<string, string> // Recipe parameter values from deeplink URL
 ) => {
-  // Initialize variables for process and configuration
-  let port = 0;
-  let working_dir = '';
-  let goosedProcess: import('child_process').ChildProcess | null = null;
+  updateEnvironmentVariables(envToggles);
 
-  if (viewType === 'recipeEditor') {
-    // For recipeEditor, get the port from existing windows' config
-    const existingWindows = BrowserWindow.getAllWindows();
-    if (existingWindows.length > 0) {
-      // Get the config from localStorage through an existing window
-      try {
-        const config = await existingWindows[0].webContents.executeJavaScript(
-          `window.electron.getConfig()`
-        );
-        if (config) {
-          port = config.GOOSE_PORT;
-          working_dir = config.GOOSE_WORKING_DIR;
-        }
-      } catch (e) {
-        console.error('Failed to get config from localStorage:', e);
-      }
-    }
-    if (port === 0) {
-      console.error('No existing Goose process found for recipeEditor');
-      throw new Error('Cannot create recipeEditor window: No existing Goose process found');
-    }
-  } else {
-    // Apply current environment settings before creating chat
-    updateEnvironmentVariables(envToggles);
+  const envVars = {
+    GOOSE_PATH_ROOT: process.env.GOOSE_PATH_ROOT,
+  };
+  const [port, workingDir, goosedProcess, errorLog] = await startGoosed(
+    app,
+    SERVER_SECRET,
+    dir || os.homedir(),
+    envVars
+  );
 
-    // Apply scheduling engine setting
-    const settings = loadSettings();
-    updateSchedulingEngineEnvironment(settings.schedulingEngine);
-
-    // Start new Goosed process for regular windows
-    // Pass through scheduling engine environment variables
-    const envVars = {
-      GOOSE_SCHEDULER_TYPE: process.env.GOOSE_SCHEDULER_TYPE,
-    };
-    const [newPort, newWorkingDir, newGoosedProcess] = await startGoosed(
-      app,
-      SERVER_SECRET,
-      dir,
-      envVars
-    );
-    port = newPort;
-    working_dir = newWorkingDir;
-    goosedProcess = newGoosedProcess;
-  }
-
-  // Create window config with loading state for recipe deeplinks
-  let isLoadingRecipe = false;
-  if (!recipe && recipeDeeplink) {
-    isLoadingRecipe = true;
-    console.log('[Main] Creating window with recipe loading state for deeplink:', recipeDeeplink);
-  }
-
-  // Load and manage window state
   const mainWindowState = windowStateKeeper({
-    defaultWidth: 940, // large enough to show the sidebar on launch
+    defaultWidth: 940,
     defaultHeight: 800,
   });
 
@@ -591,10 +527,10 @@ const createChat = async (
     y: mainWindowState.y,
     width: mainWindowState.width,
     height: mainWindowState.height,
-    minWidth: 750,
+    minWidth: 450,
     resizable: true,
     useContentSize: true,
-    icon: path.join(__dirname, '../images/icon'),
+    icon: path.join(__dirname, '../images/icon.icns'),
     webPreferences: {
       spellcheck: true,
       preload: path.join(__dirname, 'preload.js'),
@@ -604,107 +540,117 @@ const createChat = async (
       contextIsolation: true,
       additionalArguments: [
         JSON.stringify({
-          ...appConfig, // Use the potentially updated appConfig
-          GOOSE_PORT: port, // Ensure this specific window gets the correct port
-          GOOSE_WORKING_DIR: working_dir,
+          ...appConfig,
+          GOOSE_PORT: port,
+          GOOSE_WORKING_DIR: workingDir,
           REQUEST_DIR: dir,
-          GOOSE_BASE_URL_SHARE: sharingUrl,
-          GOOSE_VERSION: gooseVersion,
-          recipe: recipe,
+          GOOSE_BASE_URL_SHARE: baseUrlShare,
+          GOOSE_VERSION: version,
+          recipeId: recipeId,
+          recipeDeeplink: recipeDeeplink,
+          recipeParameters: recipeParameters,
+          scheduledJobId: scheduledJobId,
         }),
       ],
       partition: 'persist:goose', // Add this line to ensure persistence
     },
   });
 
+  if (!app.isPackaged) {
+    installExtension(REACT_DEVELOPER_TOOLS, {
+      loadExtensionOptions: { allowFileAccess: true },
+      session: mainWindow.webContents.session,
+    })
+      .then(() => log.info('added react dev tools'))
+      .catch((err) => log.info('failed to install react dev tools:', err));
+  }
+
+  const goosedClient = createClient(
+    createConfig({
+      baseUrl: `http://127.0.0.1:${port}`,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Secret-Key': SERVER_SECRET,
+      },
+    })
+  );
+  goosedClients.set(mainWindow.id, goosedClient);
+
+  const serverReady = await checkServerStatus(goosedClient, errorLog);
+  if (!serverReady) {
+    dialog.showMessageBoxSync({
+      type: 'error',
+      title: 'Goose Failed to Start',
+      message: 'The backend server failed to start.',
+      detail: errorLog.join('\n'),
+      buttons: ['OK'],
+    });
+    app.quit();
+  }
+
   // Let windowStateKeeper manage the window
   mainWindowState.manage(mainWindow);
 
-  // Enable spellcheck / right and ctrl + click on mispelled word
-  //
-  // NOTE: We could use webContents.session.availableSpellCheckerLanguages to include
-  // all languages in the list of spell checked words, but it diminishes the times you
-  // get red squigglies back for mispelled english words. Given the rest of Goose only
-  // renders in english right now, this feels like the correct set of language codes
-  // for the moment.
-  //
-  // TODO: Load language codes from a setting if we ever have i18n/l10n
   mainWindow.webContents.session.setSpellCheckerLanguages(['en-US', 'en-GB']);
   mainWindow.webContents.on('context-menu', (_event, params) => {
     const menu = new Menu();
+    const hasSpellingSuggestions = params.dictionarySuggestions.length > 0 || params.misspelledWord;
 
-    // Add each spelling suggestion
-    for (const suggestion of params.dictionarySuggestions) {
+    if (hasSpellingSuggestions) {
+      for (const suggestion of params.dictionarySuggestions) {
+        menu.append(
+          new MenuItem({
+            label: suggestion,
+            click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+          })
+        );
+      }
+
+      if (params.misspelledWord) {
+        menu.append(
+          new MenuItem({
+            label: 'Add to dictionary',
+            click: () =>
+              mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+          })
+        );
+      }
+
+      if (params.selectionText) {
+        menu.append(new MenuItem({ type: 'separator' }));
+      }
+    }
+    if (params.selectionText) {
       menu.append(
         new MenuItem({
-          label: suggestion,
-          click: () => mainWindow.webContents.replaceMisspelling(suggestion),
+          label: 'Cut',
+          accelerator: 'CmdOrCtrl+X',
+          role: 'cut',
+        })
+      );
+      menu.append(
+        new MenuItem({
+          label: 'Copy',
+          accelerator: 'CmdOrCtrl+C',
+          role: 'copy',
         })
       );
     }
 
-    // Allow users to add the misspelled word to the dictionary
-    if (params.misspelledWord) {
+    // Only show paste in editable fields (text inputs)
+    if (params.isEditable) {
       menu.append(
         new MenuItem({
-          label: 'Add to dictionary',
-          click: () =>
-            mainWindow.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
+          label: 'Paste',
+          accelerator: 'CmdOrCtrl+V',
+          role: 'paste',
         })
       );
     }
 
-    menu.popup();
-  });
-
-  // Store config in localStorage for future windows
-  const windowConfig = {
-    ...appConfig, // Use the potentially updated appConfig here as well
-    GOOSE_PORT: port, // Ensure this specific window's config gets the correct port
-    GOOSE_WORKING_DIR: working_dir,
-    REQUEST_DIR: dir,
-    GOOSE_BASE_URL_SHARE: sharingUrl,
-    recipe: recipe,
-  };
-
-  // We need to wait for the window to load before we can access localStorage
-  mainWindow.webContents.on('did-finish-load', () => {
-    const configStr = JSON.stringify(windowConfig).replace(/'/g, "\\'");
-    mainWindow.webContents
-      .executeJavaScript(
-        `
-      (function() {
-        function setConfig() {
-          try {
-            if (document.readyState === 'complete' && window.localStorage) {
-              localStorage.setItem('gooseConfig', '${configStr}');
-              return true;
-            }
-          } catch (e) {
-            console.warn('[Renderer] localStorage access failed:', e);
-          }
-          return false;
-        }
-
-        // If document is already complete, try immediately
-        if (document.readyState === 'complete') {
-          if (!setConfig()) {
-            console.error('[Renderer] Failed to set localStorage config despite document being ready');
-          }
-        } else {
-          // Wait for document to be fully ready
-          document.addEventListener('DOMContentLoaded', () => {
-            if (!setConfig()) {
-              console.error('[Renderer] Failed to set localStorage config after DOMContentLoaded');
-            }
-          });
-        }
-      })();
-    `
-      )
-      .catch((error) => {
-        console.error('Failed to execute localStorage script:', error);
-      });
+    if (menu.items.length > 0) {
+      menu.popup();
+    }
   });
 
   // Handle new window creation for links
@@ -725,42 +671,60 @@ const createChat = async (
     shell.openExternal(url);
   });
 
-  // Load the index.html of the app.
-  let queryParams = '';
-  if (query) {
-    queryParams = `?initialQuery=${encodeURIComponent(query)}`;
-  }
+  const windowId = mainWindow.id;
+  const url = MAIN_WINDOW_VITE_DEV_SERVER_URL
+    ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL)
+    : pathToFileURL(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
 
-  // Add resumeSessionId to query params if provided
-  if (resumeSessionId) {
-    queryParams = queryParams
-      ? `${queryParams}&resumeSessionId=${encodeURIComponent(resumeSessionId)}`
-      : `?resumeSessionId=${encodeURIComponent(resumeSessionId)}`;
-  }
+  let appPath = '/';
+  const routeMap: Record<string, string> = {
+    chat: '/',
+    pair: '/pair',
+    settings: '/settings',
+    sessions: '/sessions',
+    schedules: '/schedules',
+    recipes: '/recipes',
+    permission: '/permission',
+    ConfigureProviders: '/configure-providers',
+    sharedSession: '/shared-session',
+    welcome: '/welcome',
+  };
 
-  // Add view type to query params if provided
   if (viewType) {
-    queryParams = queryParams
-      ? `${queryParams}&view=${encodeURIComponent(viewType)}`
-      : `?view=${encodeURIComponent(viewType)}`;
+    appPath = routeMap[viewType] || '/';
+  }
+  if (
+    appPath === '/' &&
+    (recipeDeeplink !== undefined || recipeId !== undefined || initialMessage)
+  ) {
+    appPath = '/pair';
   }
 
-  // For recipe deeplinks, navigate directly to pair view
-  if (recipe || recipeDeeplink) {
-    queryParams = queryParams ? `${queryParams}&view=pair` : `?view=pair`;
+  let searchParams = new URLSearchParams();
+  if (resumeSessionId) {
+    searchParams.set('resumeSessionId', resumeSessionId);
+    if (appPath === '/') {
+      appPath = '/pair';
+    }
+  }
+  // Only add recipeId to URL for the non-deeplink case (saved recipes launched from UI)
+  // For deeplinks, the recipe object is passed via appConfig, not URL params
+  if (recipeId) {
+    searchParams.set('recipeId', recipeId);
+    if (appPath === '/') {
+      appPath = '/pair';
+    }
   }
 
-  // Increment window counter to track number of windows
-  const windowId = ++windowCounter;
+  // Goose's react app uses HashRouter, so the path + search params follow a #/
+  url.hash = `${appPath}?${searchParams.toString()}`;
+  let formattedUrl = formatUrl(url);
+  log.info('Opening URL: ', formattedUrl);
+  mainWindow.loadURL(formattedUrl);
 
-  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
-    mainWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}${queryParams}`);
-  } else {
-    // In production, we need to use a proper file protocol URL with correct base path
-    const indexPath = path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`);
-    mainWindow.loadFile(indexPath, {
-      search: queryParams ? queryParams.slice(1) : undefined,
-    });
+  // If we have an initial message, store it to send after React is ready
+  if (initialMessage) {
+    pendingInitialMessages.set(mainWindow.id, initialMessage);
   }
 
   // Set up local keyboard shortcuts that only work when the window is focused
@@ -795,63 +759,12 @@ const createChat = async (
 
   windowMap.set(windowId, mainWindow);
 
-  // Handle recipe decoding in the background after window is created
-  if (isLoadingRecipe && recipeDeeplink) {
-    console.log('[Main] Starting background recipe decoding for:', recipeDeeplink);
-
-    // Decode recipe asynchronously after window is created
-    decodeRecipeMain(recipeDeeplink, port)
-      .then((decodedRecipe) => {
-        if (decodedRecipe) {
-          console.log('[Main] Recipe decoded successfully, updating window config');
-
-          // Handle scheduled job parameters if present
-          if (scheduledJobId) {
-            decodedRecipe.scheduledJobId = scheduledJobId;
-            decodedRecipe.isScheduledExecution = true;
-          }
-
-          // Update the window config with the decoded recipe
-          const updatedConfig = {
-            ...windowConfig,
-            recipe: decodedRecipe,
-          };
-
-          // Send the decoded recipe to the renderer process
-          mainWindow.webContents.send('recipe-decoded', decodedRecipe);
-
-          // Update localStorage with the decoded recipe
-          const configStr = JSON.stringify(updatedConfig).replace(/'/g, "\\'");
-          mainWindow.webContents
-            .executeJavaScript(
-              `
-            try {
-              localStorage.setItem('gooseConfig', '${configStr}');
-              console.log('[Renderer] Recipe decoded and config updated');
-            } catch (e) {
-              console.error('[Renderer] Failed to update config with decoded recipe:', e);
-            }
-          `
-            )
-            .catch((error) => {
-              console.error('[Main] Failed to update localStorage with decoded recipe:', error);
-            });
-        } else {
-          console.error('[Main] Failed to decode recipe from deeplink');
-          // Send error to renderer
-          mainWindow.webContents.send('recipe-decode-error', 'Failed to decode recipe');
-        }
-      })
-      .catch((error) => {
-        console.error('[Main] Error decoding recipe:', error);
-        // Send error to renderer
-        mainWindow.webContents.send('recipe-decode-error', error.message || 'Unknown error');
-      });
-  }
-
   // Handle window closure
   mainWindow.on('closed', () => {
     windowMap.delete(windowId);
+
+    // Clean up pending initial message
+    pendingInitialMessages.delete(windowId);
 
     if (windowPowerSaveBlockers.has(windowId)) {
       const blockerId = windowPowerSaveBlockers.get(windowId)!;
@@ -876,6 +789,65 @@ const createChat = async (
   return mainWindow;
 };
 
+const createLauncher = () => {
+  const launcherWindow = new BrowserWindow({
+    width: 600,
+    height: 80,
+    frame: false,
+    transparent: process.platform === 'darwin',
+    backgroundColor: process.platform === 'darwin' ? '#00000000' : '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      additionalArguments: [JSON.stringify(appConfig)],
+      partition: 'persist:goose',
+    },
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    hasShadow: true,
+    vibrancy: process.platform === 'darwin' ? 'window' : undefined,
+  });
+
+  // Center on screen
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+  const windowBounds = launcherWindow.getBounds();
+
+  launcherWindow.setPosition(
+    Math.round(width / 2 - windowBounds.width / 2),
+    Math.round(height / 3 - windowBounds.height / 2)
+  );
+
+  // Load launcher window content
+  const url = MAIN_WINDOW_VITE_DEV_SERVER_URL
+    ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL)
+    : pathToFileURL(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
+
+  url.hash = '/launcher';
+  launcherWindow.loadURL(formatUrl(url));
+
+  // Destroy window when it loses focus
+  launcherWindow.on('blur', () => {
+    launcherWindow.destroy();
+  });
+
+  // Also destroy on escape key
+  launcherWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'Escape') {
+      launcherWindow.destroy();
+      event.preventDefault();
+    }
+  });
+
+  return launcherWindow;
+};
+
 // Track tray instance
 let tray: Tray | null = null;
 
@@ -886,30 +858,43 @@ const destroyTray = () => {
   }
 };
 
+const disableTray = () => {
+  const settings = loadSettings();
+  settings.showMenuBarIcon = false;
+  saveSettings(settings);
+};
+
 const createTray = () => {
-  // If tray already exists, destroy it first
   destroyTray();
 
-  const isDev = process.env.NODE_ENV === 'development';
-  let iconPath: string;
+  const possiblePaths = [
+    path.join(process.resourcesPath, 'images', 'iconTemplate.png'),
+    path.join(process.cwd(), 'src', 'images', 'iconTemplate.png'),
+    path.join(__dirname, '..', 'images', 'iconTemplate.png'),
+    path.join(__dirname, 'images', 'iconTemplate.png'),
+    path.join(process.cwd(), 'images', 'iconTemplate.png'),
+  ];
 
-  if (isDev) {
-    iconPath = path.join(process.cwd(), 'src', 'images', 'iconTemplate.png');
-  } else {
-    iconPath = path.join(process.resourcesPath, 'images', 'iconTemplate.png');
+  const iconPath = possiblePaths.find((p) => fsSync.existsSync(p));
+
+  if (!iconPath) {
+    console.warn('[Main] Tray icon not found. App will continue without system tray.');
+    disableTray();
+    return;
   }
 
-  tray = new Tray(iconPath);
+  try {
+    tray = new Tray(iconPath);
+    setTrayRef(tray);
+    updateTrayMenu(getUpdateAvailable());
 
-  // Set tray reference for auto-updater
-  setTrayRef(tray);
-
-  // Initially build menu based on update status
-  updateTrayMenu(getUpdateAvailable());
-
-  // On Windows, clicking the tray icon should show the window
-  if (process.platform === 'win32') {
-    tray.on('click', showWindow);
+    if (process.platform === 'win32') {
+      tray.on('click', showWindow);
+    }
+  } catch (error) {
+    console.error('[Main] Tray creation failed. App will continue without system tray.', error);
+    disableTray();
+    tray = null;
   }
 };
 
@@ -924,7 +909,6 @@ const showWindow = async () => {
     return;
   }
 
-  // Define the initial offset values
   const initialOffsetX = 30;
   const initialOffsetY = 30;
 
@@ -1037,11 +1021,81 @@ const openDirectoryDialog = async (): Promise<OpenDialogReturnValue> => {
     }
 
     addRecentDir(dirToAdd);
+
+    let deeplinkData: RecipeDeeplinkData | undefined = undefined;
+    if (windowDeeplinkURL) {
+      deeplinkData = parseRecipeDeeplink(windowDeeplinkURL);
+    }
     // Create a new window with the selected directory
-    await createChat(app, undefined, dirToAdd);
+    await createChat(
+      app,
+      undefined,
+      dirToAdd,
+      undefined,
+      undefined,
+      undefined,
+      deeplinkData?.config,
+      undefined,
+      undefined,
+      deeplinkData?.parameters
+    );
   }
   return result;
 };
+
+interface RecipeDeeplinkData {
+  config: string;
+  parameters?: Record<string, string>;
+}
+
+function parseRecipeDeeplink(url: string): RecipeDeeplinkData | undefined {
+  const parsedUrl = new URL(url);
+  let recipeDeeplink = parsedUrl.searchParams.get('config');
+  if (recipeDeeplink && !url.includes(recipeDeeplink)) {
+    // URLSearchParams decodes + as space, which can break encoded configs
+    // Parse raw query to preserve "+" characters in values like config
+    const search = parsedUrl.search || '';
+    const configMatch = search.match(/(?:[?&])config=([^&]*)/);
+    let recipeDeeplinkTmp = configMatch ? configMatch[1] : null;
+    if (recipeDeeplinkTmp) {
+      try {
+        recipeDeeplink = decodeURIComponent(recipeDeeplinkTmp);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error('[Main] parseRecipeDeeplink - Failed to decode:', errorMessage);
+        return undefined;
+      }
+    }
+  }
+  if (!recipeDeeplink) {
+    return undefined;
+  }
+
+  // Extract all query parameters except 'config' and 'scheduledJob' as recipe parameters
+  // Use raw query string parsing to preserve '+' characters (consistent with config handling)
+  const parameters: Record<string, string> = {};
+  const search = parsedUrl.search || '';
+  const paramMatches = search.matchAll(/[?&]([^=&]+)=([^&]*)/g);
+
+  for (const match of paramMatches) {
+    const key = match[1];
+    const rawValue = match[2];
+
+    if (key !== 'config' && key !== 'scheduledJob') {
+      try {
+        parameters[key] = decodeURIComponent(rawValue);
+      } catch {
+        // If decoding fails, use raw value
+        parameters[key] = rawValue;
+      }
+    }
+  }
+
+  return {
+    config: recipeDeeplink,
+    parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+  };
+}
 
 // Global error handler
 const handleFatalError = (error: Error) => {
@@ -1061,19 +1115,29 @@ process.on('unhandledRejection', (error) => {
   handleFatalError(error instanceof Error ? error : new Error(String(error)));
 });
 
-ipcMain.on('react-ready', () => {
-  console.log('React ready event received');
+ipcMain.on('react-ready', (event) => {
+  log.info('React ready event received');
 
-  if (pendingDeepLink) {
-    console.log('Processing pending deep link:', pendingDeepLink);
-    handleProtocolUrl(pendingDeepLink);
-  } else {
-    console.log('No pending deep link to process');
+  // Get the window that sent the react-ready event
+  const window = BrowserWindow.fromWebContents(event.sender);
+  const windowId = window?.id;
+
+  // Send any pending initial message for this window
+  if (windowId && pendingInitialMessages.has(windowId)) {
+    const initialMessage = pendingInitialMessages.get(windowId)!;
+    log.info('Sending pending initial message to window:', initialMessage);
+    window.webContents.send('set-initial-message', initialMessage);
+    pendingInitialMessages.delete(windowId);
   }
 
-  // We don't need to handle pending deep links here anymore
-  // since we're handling them in the window creation flow
-  console.log('[main] React ready - window is prepared for deep links');
+  if (pendingDeepLink) {
+    log.info('Processing pending deep link:', pendingDeepLink);
+    handleProtocolUrl(pendingDeepLink);
+  } else {
+    log.info('No pending deep link to process');
+  }
+
+  log.info('React ready - window is prepared for deep links');
 });
 
 // Handle external URL opening
@@ -1106,20 +1170,16 @@ ipcMain.handle('get-secret-key', () => {
   return SERVER_SECRET;
 });
 
-ipcMain.handle('set-scheduling-engine', async (_event, engine: string) => {
-  try {
-    const settings = loadSettings();
-    settings.schedulingEngine = engine as SchedulingEngine;
-    saveSettings(settings);
-
-    // Update the environment variable immediately
-    updateSchedulingEngineEnvironment(settings.schedulingEngine);
-
-    return true;
-  } catch (error) {
-    console.error('Error setting scheduling engine:', error);
-    return false;
+ipcMain.handle('get-goosed-host-port', async (event) => {
+  const windowId = BrowserWindow.fromWebContents(event.sender)?.id;
+  if (!windowId) {
+    return null;
   }
+  const client = goosedClients.get(windowId);
+  if (!client) {
+    return null;
+  }
+  return client.getConfig().baseUrl || null;
 });
 
 // Handle menu bar icon visibility
@@ -1576,11 +1636,6 @@ ipcMain.handle('check-ollama', async () => {
   }
 });
 
-// Handle binary path requests
-ipcMain.handle('get-binary-path', (_event, binaryName) => {
-  return getBinaryPath(app, binaryName);
-});
-
 ipcMain.handle('read-file', async (_event, filePath) => {
   try {
     const expandedPath = expandTilde(filePath);
@@ -1690,33 +1745,10 @@ const focusWindow = () => {
   }
 };
 
-const registerGlobalHotkey = (accelerator: string) => {
-  // Unregister any existing shortcuts first
-  globalShortcut.unregisterAll();
-
-  try {
-    globalShortcut.register(accelerator, () => {
-      focusWindow();
-    });
-
-    // Check if the shortcut was registered successfully
-    if (globalShortcut.isRegistered(accelerator)) {
-      return true;
-    } else {
-      console.error('Failed to register global hotkey');
-      return false;
-    }
-  } catch (e) {
-    console.error('Error registering global hotkey:', e);
-    return false;
-  }
-};
-
-app.whenReady().then(async () => {
+async function appMain() {
   // Ensure Windows shims are available before any MCP processes are spawned
   await ensureWinShims();
 
-  // Register update IPC handlers once (but don't setup auto-updater yet)
   registerUpdateIpcHandlers();
 
   // Handle microphone permission requests
@@ -1768,8 +1800,13 @@ app.whenReady().then(async () => {
     });
   });
 
-  // Register the default global hotkey
-  registerGlobalHotkey('CommandOrControl+Alt+Shift+G');
+  try {
+    globalShortcut.register('CommandOrControl+Alt+Shift+G', () => {
+      createLauncher();
+    });
+  } catch (e) {
+    console.error('Error registering launcher hotkey:', e);
+  }
 
   session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
     details.requestHeaders['Origin'] = 'http://localhost:5173';
@@ -1787,7 +1824,6 @@ app.whenReady().then(async () => {
     app.dock?.hide();
   }
 
-  // Parse command line arguments
   const { dirPath } = parseArgs();
 
   await createNewWindow(app, dirPath);
@@ -1803,6 +1839,19 @@ app.whenReady().then(async () => {
       }
     }
   }, 2000); // 2 second delay after window is shown
+
+  // Setup macOS dock menu
+  if (process.platform === 'darwin') {
+    const dockMenu = Menu.buildFromTemplate([
+      {
+        label: 'New Window',
+        click: () => {
+          createNewWindow(app);
+        },
+      },
+    ]);
+    app.dock?.setMenu(dockMenu);
+  }
 
   // Get the existing menu
   const menu = Menu.getApplicationMenu();
@@ -1885,6 +1934,18 @@ app.whenReady().then(async () => {
     fileMenu.submenu.insert(
       0,
       new MenuItem({
+        label: 'New Chat',
+        accelerator: 'CmdOrCtrl+T',
+        click() {
+          const focusedWindow = BrowserWindow.getFocusedWindow();
+          if (focusedWindow) focusedWindow.webContents.send('set-view', '');
+        },
+      })
+    );
+
+    fileMenu.submenu.insert(
+      1,
+      new MenuItem({
         label: 'New Chat Window',
         accelerator: process.platform === 'darwin' ? 'Cmd+N' : 'Ctrl+N',
         click() {
@@ -1895,7 +1956,7 @@ app.whenReady().then(async () => {
 
     // Open goose to specific dir and set that as its working space
     fileMenu.submenu.insert(
-      1,
+      2,
       new MenuItem({
         label: 'Open Directory...',
         accelerator: 'CmdOrCtrl+O',
@@ -1907,7 +1968,7 @@ app.whenReady().then(async () => {
     const recentFilesSubmenu = buildRecentFilesMenu();
     if (recentFilesSubmenu.length > 0) {
       fileMenu.submenu.insert(
-        2,
+        3,
         new MenuItem({
           label: 'Recent Directories',
           submenu: recentFilesSubmenu,
@@ -1915,7 +1976,7 @@ app.whenReady().then(async () => {
       );
     }
 
-    fileMenu.submenu.insert(3, new MenuItem({ type: 'separator' }));
+    fileMenu.submenu.insert(4, new MenuItem({ type: 'separator' }));
 
     // The Close Window item is here.
 
@@ -1929,6 +1990,50 @@ app.whenReady().then(async () => {
         },
       })
     );
+  }
+
+  if (menu) {
+    let windowMenu = menu.items.find((item) => item.label === 'Window');
+
+    if (!windowMenu) {
+      windowMenu = new MenuItem({
+        label: 'Window',
+        submenu: Menu.buildFromTemplate([]),
+      });
+
+      const helpMenuIndex = menu.items.findIndex((item) => item.label === 'Help');
+      if (helpMenuIndex >= 0) {
+        menu.items.splice(helpMenuIndex, 0, windowMenu);
+      } else {
+        menu.items.push(windowMenu);
+      }
+    }
+
+    if (windowMenu.submenu) {
+      windowMenu.submenu.append(
+        new MenuItem({
+          label: 'Always on Top',
+          type: 'checkbox',
+          accelerator: process.platform === 'darwin' ? 'Cmd+Shift+T' : 'Ctrl+Shift+T',
+          click(menuItem) {
+            const focusedWindow = BrowserWindow.getFocusedWindow();
+            if (focusedWindow) {
+              const isAlwaysOnTop = menuItem.checked;
+
+              if (process.platform === 'darwin') {
+                focusedWindow.setAlwaysOnTop(isAlwaysOnTop, 'floating');
+              } else {
+                focusedWindow.setAlwaysOnTop(isAlwaysOnTop);
+              }
+
+              console.log(
+                `[Main] Set always-on-top to ${isAlwaysOnTop} for window ${focusedWindow.id}`
+              );
+            }
+          },
+        })
+      );
+    }
   }
 
   // on macOS, the topbar is hidden
@@ -1963,7 +2068,7 @@ app.whenReady().then(async () => {
       if (aboutGooseMenuItem.submenu) {
         aboutGooseMenuItem.submenu.append(
           new MenuItem({
-            label: `Version ${gooseVersion || app.getVersion()}`,
+            label: `Version ${version || app.getVersion()}`,
             enabled: false,
           })
         );
@@ -1983,20 +2088,36 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.on('create-chat-window', (_, query, dir, version, resumeSessionId, recipe, viewType) => {
-    if (!dir?.trim()) {
-      const recentDirs = loadRecentDirs();
-      dir = recentDirs.length > 0 ? recentDirs[0] : undefined;
+  ipcMain.on(
+    'create-chat-window',
+    (_, query, dir, version, resumeSessionId, viewType, recipeId) => {
+      if (!dir?.trim()) {
+        const recentDirs = loadRecentDirs();
+        dir = recentDirs.length > 0 ? recentDirs[0] : undefined;
+      }
+
+      createChat(
+        app,
+        query,
+        dir,
+        version,
+        resumeSessionId,
+        viewType,
+        undefined,
+        undefined,
+        recipeId
+      );
     }
+  );
 
-    // Log the recipe for debugging
-    console.log('Creating chat window with recipe:', recipe);
-
-    // Pass recipe as part of viewOptions when viewType is recipeEditor
-    createChat(app, query, dir, version, resumeSessionId, recipe, viewType);
+  ipcMain.on('close-window', (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window && !window.isDestroyed()) {
+      window.close();
+    }
   });
 
-  ipcMain.on('notify', (_event, data) => {
+  ipcMain.on('notify', (event, data) => {
     try {
       // Validate notification data
       if (!data || typeof data !== 'object') {
@@ -2021,10 +2142,24 @@ app.whenReady().then(async () => {
       const sanitizeText = (text: string) => text.replace(/<[^>]*>/g, '');
 
       console.log('NOTIFY', data);
-      new Notification({
+      const notification = new Notification({
         title: sanitizeText(data.title),
         body: sanitizeText(data.body),
-      }).show();
+      });
+
+      // Add click handler to focus the window
+      notification.on('click', () => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        if (window) {
+          if (window.isMinimized()) {
+            window.restore();
+          }
+          window.show();
+          window.focus();
+        }
+      });
+
+      notification.show();
     } catch (error) {
       console.error('Error showing notification:', error);
     }
@@ -2055,45 +2190,23 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.on('broadcast-theme-change', (event, themeData) => {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    const allWindows = BrowserWindow.getAllWindows();
+
+    allWindows.forEach((window) => {
+      if (window.id !== senderWindow?.id) {
+        window.webContents.send('theme-changed', themeData);
+      }
+    });
+  });
+
   ipcMain.on('reload-app', (event) => {
     // Get the window that sent the event
     const window = BrowserWindow.fromWebContents(event.sender);
     if (window) {
       window.reload();
     }
-  });
-
-  ipcMain.handle('start-power-save-blocker', (event) => {
-    const window = BrowserWindow.fromWebContents(event.sender);
-    const windowId = window?.id;
-
-    if (windowId && !windowPowerSaveBlockers.has(windowId)) {
-      const blockerId = powerSaveBlocker.start('prevent-app-suspension');
-      windowPowerSaveBlockers.set(windowId, blockerId);
-      console.log(`[Main] Started power save blocker ${blockerId} for window ${windowId}`);
-      return true;
-    }
-
-    if (windowId && windowPowerSaveBlockers.has(windowId)) {
-      console.log(`[Main] Power save blocker already active for window ${windowId}`);
-    }
-
-    return false;
-  });
-
-  ipcMain.handle('stop-power-save-blocker', (event) => {
-    const window = BrowserWindow.fromWebContents(event.sender);
-    const windowId = window?.id;
-
-    if (windowId && windowPowerSaveBlockers.has(windowId)) {
-      const blockerId = windowPowerSaveBlockers.get(windowId)!;
-      powerSaveBlocker.stop(blockerId);
-      windowPowerSaveBlockers.delete(windowId);
-      console.log(`[Main] Stopped power save blocker ${blockerId} for window ${windowId}`);
-      return true;
-    }
-
-    return false;
   });
 
   // Handle metadata fetching from main process
@@ -2181,6 +2294,15 @@ app.whenReady().then(async () => {
       return false;
     }
   });
+}
+
+app.whenReady().then(async () => {
+  try {
+    await appMain();
+  } catch (error) {
+    dialog.showErrorBox('Goose Error', `Failed to create main window: ${error}`);
+    app.quit();
+  }
 });
 
 async function getAllowList(): Promise<string[]> {

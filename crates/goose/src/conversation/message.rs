@@ -1,11 +1,11 @@
+use crate::mcp_utils::ToolResult;
 use chrono::Utc;
-use mcp_core::{ToolCall, ToolResult};
 use rmcp::model::{
-    AnnotateAble, Content, ImageContent, PromptMessage, PromptMessageContent, PromptMessageRole,
-    RawContent, RawImageContent, RawTextContent, ResourceContents, Role, TextContent,
+    AnnotateAble, CallToolRequestParam, Content, ImageContent, JsonObject, PromptMessage,
+    PromptMessageContent, PromptMessageRole, RawContent, RawImageContent, RawTextContent,
+    ResourceContents, Role, TextContent,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
 use utoipa::ToSchema;
@@ -13,12 +13,26 @@ use utoipa::ToSchema;
 use crate::conversation::tool_result_serde;
 use crate::utils::sanitize_unicode_tags;
 
+#[derive(ToSchema)]
+pub enum ToolCallResult<T> {
+    Success { value: T },
+    Error { error: String },
+}
+
 /// Custom deserializer for MessageContent that sanitizes Unicode Tags in text content
 fn deserialize_sanitized_content<'de, D>(deserializer: D) -> Result<Vec<MessageContent>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let mut content: Vec<MessageContent> = Vec::deserialize(deserializer)?;
+    use serde::de::Error;
+
+    let mut raw: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+
+    // Filter out old "conversationCompacted" messages from pre-14.0
+    raw.retain(|item| item.get("type").and_then(|v| v.as_str()) != Some("conversationCompacted"));
+
+    let mut content: Vec<MessageContent> = serde_json::from_value(serde_json::Value::Array(raw))
+        .map_err(|e| Error::custom(format!("Failed to deserialize MessageContent: {}", e)))?;
 
     for message_content in &mut content {
         if let MessageContent::Text(text_content) = message_content {
@@ -46,7 +60,9 @@ pub struct ToolRequest {
     pub id: String,
     #[serde(with = "tool_result_serde")]
     #[schema(value_type = Object)]
-    pub tool_call: ToolResult<ToolCall>,
+    pub tool_call: ToolResult<CallToolRequestParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 impl ToolRequest {
@@ -81,8 +97,35 @@ pub struct ToolResponse {
 pub struct ToolConfirmationRequest {
     pub id: String,
     pub tool_name: String,
-    pub arguments: Value,
+    pub arguments: JsonObject,
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "actionType", rename_all = "camelCase")]
+pub enum ActionRequiredData {
+    #[serde(rename_all = "camelCase")]
+    ToolConfirmation {
+        id: String,
+        tool_name: String,
+        arguments: JsonObject,
+        prompt: Option<String>,
+    },
+    Elicitation {
+        id: String,
+        message: String,
+        requested_schema: serde_json::Value,
+    },
+    ElicitationResponse {
+        id: String,
+        user_data: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionRequired {
+    pub data: ActionRequiredData,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -102,16 +145,20 @@ pub struct FrontendToolRequest {
     pub id: String,
     #[serde(with = "tool_result_serde")]
     #[schema(value_type = Object)]
-    pub tool_call: ToolResult<ToolCall>,
+    pub tool_call: ToolResult<CallToolRequestParam>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ContextLengthExceeded {
-    pub msg: String,
+#[serde(rename_all = "camelCase")]
+pub enum SystemNotificationType {
+    ThinkingMessage,
+    InlineMessage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct SummarizationRequested {
+#[serde(rename_all = "camelCase")]
+pub struct SystemNotificationContent {
+    pub notification_type: SystemNotificationType,
     pub msg: String,
 }
 
@@ -124,11 +171,11 @@ pub enum MessageContent {
     ToolRequest(ToolRequest),
     ToolResponse(ToolResponse),
     ToolConfirmationRequest(ToolConfirmationRequest),
+    ActionRequired(ActionRequired),
     FrontendToolRequest(FrontendToolRequest),
     Thinking(ThinkingContent),
     RedactedThinking(RedactedThinkingContent),
-    ContextLengthExceeded(ContextLengthExceeded),
-    SummarizationRequested(SummarizationRequested),
+    SystemNotification(SystemNotificationContent),
 }
 
 impl fmt::Display for MessageContent {
@@ -150,17 +197,25 @@ impl fmt::Display for MessageContent {
             MessageContent::ToolConfirmationRequest(r) => {
                 write!(f, "[ToolConfirmationRequest: {}]", r.tool_name)
             }
+            MessageContent::ActionRequired(a) => match &a.data {
+                ActionRequiredData::ToolConfirmation { tool_name, .. } => {
+                    write!(f, "[ActionRequired: ToolConfirmation for {}]", tool_name)
+                }
+                ActionRequiredData::Elicitation { message, .. } => {
+                    write!(f, "[ActionRequired: Elicitation - {}]", message)
+                }
+                ActionRequiredData::ElicitationResponse { id, .. } => {
+                    write!(f, "[ActionRequired: ElicitationResponse for {}]", id)
+                }
+            },
             MessageContent::FrontendToolRequest(r) => match &r.tool_call {
                 Ok(tool_call) => write!(f, "[FrontendToolRequest: {}]", tool_call.name),
                 Err(e) => write!(f, "[FrontendToolRequest: Error: {}]", e),
             },
             MessageContent::Thinking(t) => write!(f, "[Thinking: {}]", t.thinking),
             MessageContent::RedactedThinking(_r) => write!(f, "[RedactedThinking]"),
-            MessageContent::ContextLengthExceeded(r) => {
-                write!(f, "[ContextLengthExceeded: {}]", r.msg)
-            }
-            MessageContent::SummarizationRequested(r) => {
-                write!(f, "[SummarizationRequested: {}]", r.msg)
+            MessageContent::SystemNotification(r) => {
+                write!(f, "[SystemNotification: {}]", r.msg)
             }
         }
     }
@@ -168,7 +223,13 @@ impl fmt::Display for MessageContent {
 
 impl MessageContent {
     pub fn text<S: Into<String>>(text: S) -> Self {
-        MessageContent::Text(RawTextContent { text: text.into() }.no_annotation())
+        MessageContent::Text(
+            RawTextContent {
+                text: text.into(),
+                meta: None,
+            }
+            .no_annotation(),
+        )
     }
 
     pub fn image<S: Into<String>, T: Into<String>>(data: S, mime_type: T) -> Self {
@@ -176,15 +237,32 @@ impl MessageContent {
             RawImageContent {
                 data: data.into(),
                 mime_type: mime_type.into(),
+                meta: None,
             }
             .no_annotation(),
         )
     }
 
-    pub fn tool_request<S: Into<String>>(id: S, tool_call: ToolResult<ToolCall>) -> Self {
+    pub fn tool_request<S: Into<String>>(
+        id: S,
+        tool_call: ToolResult<CallToolRequestParam>,
+    ) -> Self {
         MessageContent::ToolRequest(ToolRequest {
             id: id.into(),
             tool_call,
+            thought_signature: None,
+        })
+    }
+
+    pub fn tool_request_with_signature<S1: Into<String>, S2: Into<String>>(
+        id: S1,
+        tool_call: ToolResult<CallToolRequestParam>,
+        thought_signature: Option<S2>,
+    ) -> Self {
+        MessageContent::ToolRequest(ToolRequest {
+            id: id.into(),
+            tool_call,
+            thought_signature: thought_signature.map(|s| s.into()),
         })
     }
 
@@ -195,17 +273,45 @@ impl MessageContent {
         })
     }
 
-    pub fn tool_confirmation_request<S: Into<String>>(
+    pub fn action_required<S: Into<String>>(
         id: S,
         tool_name: String,
-        arguments: Value,
+        arguments: JsonObject,
         prompt: Option<String>,
     ) -> Self {
-        MessageContent::ToolConfirmationRequest(ToolConfirmationRequest {
-            id: id.into(),
-            tool_name,
-            arguments,
-            prompt,
+        MessageContent::ActionRequired(ActionRequired {
+            data: ActionRequiredData::ToolConfirmation {
+                id: id.into(),
+                tool_name,
+                arguments,
+                prompt,
+            },
+        })
+    }
+
+    pub fn action_required_elicitation<S: Into<String>>(
+        id: S,
+        message: String,
+        requested_schema: serde_json::Value,
+    ) -> Self {
+        MessageContent::ActionRequired(ActionRequired {
+            data: ActionRequiredData::Elicitation {
+                id: id.into(),
+                message,
+                requested_schema,
+            },
+        })
+    }
+
+    pub fn action_required_elicitation_response<S: Into<String>>(
+        id: S,
+        user_data: serde_json::Value,
+    ) -> Self {
+        MessageContent::ActionRequired(ActionRequired {
+            data: ActionRequiredData::ElicitationResponse {
+                id: id.into(),
+                user_data,
+            },
         })
     }
 
@@ -220,25 +326,29 @@ impl MessageContent {
         MessageContent::RedactedThinking(RedactedThinkingContent { data: data.into() })
     }
 
-    pub fn frontend_tool_request<S: Into<String>>(id: S, tool_call: ToolResult<ToolCall>) -> Self {
+    pub fn frontend_tool_request<S: Into<String>>(
+        id: S,
+        tool_call: ToolResult<CallToolRequestParam>,
+    ) -> Self {
         MessageContent::FrontendToolRequest(FrontendToolRequest {
             id: id.into(),
             tool_call,
         })
     }
 
-    pub fn context_length_exceeded<S: Into<String>>(msg: S) -> Self {
-        MessageContent::ContextLengthExceeded(ContextLengthExceeded { msg: msg.into() })
+    pub fn system_notification<S: Into<String>>(
+        notification_type: SystemNotificationType,
+        msg: S,
+    ) -> Self {
+        MessageContent::SystemNotification(SystemNotificationContent {
+            notification_type,
+            msg: msg.into(),
+        })
     }
 
-    pub fn summarization_requested<S: Into<String>>(msg: S) -> Self {
-        MessageContent::SummarizationRequested(SummarizationRequested { msg: msg.into() })
-    }
-
-    // Add this new method to check for summarization requested content
-    pub fn as_summarization_requested(&self) -> Option<&SummarizationRequested> {
-        if let MessageContent::SummarizationRequested(ref summarization_requested) = self {
-            Some(summarization_requested)
+    pub fn as_system_notification(&self) -> Option<&SystemNotificationContent> {
+        if let MessageContent::SystemNotification(ref notification) = self {
+            Some(notification)
         } else {
             None
         }
@@ -260,9 +370,9 @@ impl MessageContent {
         }
     }
 
-    pub fn as_tool_confirmation_request(&self) -> Option<&ToolConfirmationRequest> {
-        if let MessageContent::ToolConfirmationRequest(ref tool_confirmation_request) = self {
-            Some(tool_confirmation_request)
+    pub fn as_action_required(&self) -> Option<&ActionRequired> {
+        if let MessageContent::ActionRequired(ref action_required) = self {
+            Some(action_required)
         } else {
             None
         }
@@ -317,6 +427,7 @@ impl From<Content> for MessageContent {
             RawContent::Image(image) => {
                 MessageContent::Image(image.optional_annotate(content.annotations))
             }
+            RawContent::ResourceLink(_link) => MessageContent::text("[Resource link]"),
             RawContent::Resource(resource) => {
                 let text = match &resource.resource {
                     ResourceContents::TextResourceContents { text, .. } => text.clone(),
@@ -347,6 +458,7 @@ impl From<PromptMessage> for Message {
             PromptMessageContent::Image { image } => {
                 MessageContent::image(image.data.clone(), image.mime_type.clone())
             }
+            PromptMessageContent::ResourceLink { .. } => MessageContent::text("[Resource link]"),
             PromptMessageContent::Resource { resource } => {
                 // For resources, convert to text content with the resource text
                 match &resource.resource {
@@ -364,33 +476,93 @@ impl From<PromptMessage> for Message {
     }
 }
 
-#[derive(ToSchema, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(ToSchema, Clone, Copy, PartialEq, Serialize, Deserialize, Debug)]
+/// Metadata for message visibility
+#[serde(rename_all = "camelCase")]
+pub struct MessageMetadata {
+    /// Whether the message should be visible to the user in the UI
+    pub user_visible: bool,
+    /// Whether the message should be included in the agent's context window
+    pub agent_visible: bool,
+}
+
+impl Default for MessageMetadata {
+    fn default() -> Self {
+        MessageMetadata {
+            user_visible: true,
+            agent_visible: true,
+        }
+    }
+}
+
+impl MessageMetadata {
+    /// Create metadata for messages visible only to the agent
+    pub fn agent_only() -> Self {
+        MessageMetadata {
+            user_visible: false,
+            agent_visible: true,
+        }
+    }
+
+    /// Create metadata for messages visible only to the user
+    pub fn user_only() -> Self {
+        MessageMetadata {
+            user_visible: true,
+            agent_visible: false,
+        }
+    }
+
+    /// Create metadata for messages visible to neither user nor agent (archived)
+    pub fn invisible() -> Self {
+        MessageMetadata {
+            user_visible: false,
+            agent_visible: false,
+        }
+    }
+
+    /// Return a copy with agent_visible set to false
+    pub fn with_agent_invisible(self) -> Self {
+        Self {
+            agent_visible: false,
+            ..self
+        }
+    }
+
+    /// Return a copy with user_visible set to false
+    pub fn with_user_invisible(self) -> Self {
+        Self {
+            user_visible: false,
+            ..self
+        }
+    }
+
+    /// Return a copy with agent_visible set to true
+    pub fn with_agent_visible(self) -> Self {
+        Self {
+            agent_visible: true,
+            ..self
+        }
+    }
+
+    /// Return a copy with user_visible set to true
+    pub fn with_user_visible(self) -> Self {
+        Self {
+            user_visible: true,
+            ..self
+        }
+    }
+}
+
+#[derive(ToSchema, Clone, PartialEq, Serialize, Deserialize, Debug)]
 /// A message to or from an LLM
 #[serde(rename_all = "camelCase")]
 pub struct Message {
     pub id: Option<String>,
     pub role: Role,
-    #[serde(default = "default_created")]
     pub created: i64,
     #[serde(deserialize_with = "deserialize_sanitized_content")]
     pub content: Vec<MessageContent>,
-}
-
-impl fmt::Debug for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let joined_content: String = self
-            .content
-            .iter()
-            .map(|c| format!("{c}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        write!(f, "{:?}: {}", self.role, joined_content)
-    }
-}
-
-fn default_created() -> i64 {
-    0 // old messages do not have timestamps.
+    pub metadata: MessageMetadata,
 }
 
 impl Message {
@@ -400,6 +572,7 @@ impl Message {
             role,
             created,
             content,
+            metadata: MessageMetadata::default(),
         }
     }
     pub fn debug(&self) -> String {
@@ -413,6 +586,7 @@ impl Message {
             role: Role::User,
             created: Utc::now().timestamp(),
             content: Vec::new(),
+            metadata: MessageMetadata::default(),
         }
     }
 
@@ -423,6 +597,7 @@ impl Message {
             role: Role::Assistant,
             created: Utc::now().timestamp(),
             content: Vec::new(),
+            metadata: MessageMetadata::default(),
         }
     }
 
@@ -445,6 +620,7 @@ impl Message {
         self.with_content(MessageContent::Text(
             RawTextContent {
                 text: sanitized_text,
+                meta: None,
             }
             .no_annotation(),
         ))
@@ -459,7 +635,7 @@ impl Message {
     pub fn with_tool_request<S: Into<String>>(
         self,
         id: S,
-        tool_call: ToolResult<ToolCall>,
+        tool_call: ToolResult<CallToolRequestParam>,
     ) -> Self {
         self.with_content(MessageContent::tool_request(id, tool_call))
     }
@@ -473,15 +649,15 @@ impl Message {
         self.with_content(MessageContent::tool_response(id, result))
     }
 
-    /// Add a tool confirmation request to the message
-    pub fn with_tool_confirmation_request<S: Into<String>>(
+    /// Add an action required message for tool confirmation
+    pub fn with_action_required<S: Into<String>>(
         self,
         id: S,
         tool_name: String,
-        arguments: Value,
+        arguments: JsonObject,
         prompt: Option<String>,
     ) -> Self {
-        self.with_content(MessageContent::tool_confirmation_request(
+        self.with_content(MessageContent::action_required(
             id, tool_name, arguments, prompt,
         ))
     }
@@ -489,7 +665,7 @@ impl Message {
     pub fn with_frontend_tool_request<S: Into<String>>(
         self,
         id: S,
-        tool_call: ToolResult<ToolCall>,
+        tool_call: ToolResult<CallToolRequestParam>,
     ) -> Self {
         self.with_content(MessageContent::frontend_tool_request(id, tool_call))
     }
@@ -506,11 +682,6 @@ impl Message {
     /// Add redacted thinking content to the message
     pub fn with_redacted_thinking<S: Into<String>>(self, data: S) -> Self {
         self.with_content(MessageContent::redacted_thinking(data))
-    }
-
-    /// Add context length exceeded content to the message
-    pub fn with_context_length_exceeded<S: Into<String>>(self, msg: S) -> Self {
-        self.with_content(MessageContent::context_length_exceeded(msg))
     }
 
     /// Get the concatenated text content of the message, separated by newlines
@@ -583,23 +754,75 @@ impl Message {
             .all(|c| matches!(c, MessageContent::Text(_)))
     }
 
-    /// Add summarization requested to the message
-    pub fn with_summarization_requested<S: Into<String>>(self, msg: S) -> Self {
-        self.with_content(MessageContent::summarization_requested(msg))
+    pub fn with_system_notification<S: Into<String>>(
+        self,
+        notification_type: SystemNotificationType,
+        msg: S,
+    ) -> Self {
+        self.with_content(MessageContent::system_notification(notification_type, msg))
+            .with_metadata(MessageMetadata::user_only())
     }
+
+    /// Set the visibility metadata for the message
+    pub fn with_visibility(mut self, user_visible: bool, agent_visible: bool) -> Self {
+        self.metadata.user_visible = user_visible;
+        self.metadata.agent_visible = agent_visible;
+        self
+    }
+
+    /// Set the entire metadata for the message
+    pub fn with_metadata(mut self, metadata: MessageMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Mark the message as only visible to the user (not the agent)
+    pub fn user_only(mut self) -> Self {
+        self.metadata.user_visible = true;
+        self.metadata.agent_visible = false;
+        self
+    }
+
+    /// Mark the message as only visible to the agent (not the user)
+    pub fn agent_only(mut self) -> Self {
+        self.metadata.user_visible = false;
+        self.metadata.agent_visible = true;
+        self
+    }
+
+    /// Check if the message is visible to the user
+    pub fn is_user_visible(&self) -> bool {
+        self.metadata.user_visible
+    }
+
+    /// Check if the message is visible to the agent
+    pub fn is_agent_visible(&self) -> bool {
+        self.metadata.agent_visible
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenState {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub total_tokens: i32,
+    pub accumulated_input_tokens: i32,
+    pub accumulated_output_tokens: i32,
+    pub accumulated_total_tokens: i32,
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::conversation::message::{Message, MessageContent};
+    use crate::conversation::message::{Message, MessageContent, MessageMetadata};
     use crate::conversation::*;
-    use mcp_core::ToolCall;
     use rmcp::model::{
-        AnnotateAble, PromptMessage, PromptMessageContent, PromptMessageRole, RawEmbeddedResource,
-        RawImageContent, ResourceContents,
+        AnnotateAble, CallToolRequestParam, PromptMessage, PromptMessageContent, PromptMessageRole,
+        RawEmbeddedResource, RawImageContent, ResourceContents,
     };
     use rmcp::model::{ErrorCode, ErrorData};
-    use serde_json::{json, Value};
+    use rmcp::object;
+    use serde_json::Value;
 
     #[test]
     fn test_sanitize_with_text() {
@@ -621,7 +844,10 @@ mod tests {
             .with_text("Hello, I'll help you with that.")
             .with_tool_request(
                 "tool123",
-                Ok(ToolCall::new("test_tool", json!({"param": "value"}))),
+                Ok(CallToolRequestParam {
+                    name: "test_tool".into(),
+                    arguments: Some(object!({"param": "value"})),
+                }),
             );
 
         let json_str = serde_json::to_string_pretty(&message).unwrap();
@@ -700,7 +926,8 @@ mod tests {
                         }
                     }
                 }
-            ]
+            ],
+            "metadata": { "agentVisible": true, "userVisible": true }
         }"#;
 
         let message: Message = serde_json::from_str(json_str).unwrap();
@@ -721,7 +948,7 @@ mod tests {
             assert_eq!(req.id, "tool123");
             if let Ok(tool_call) = &req.tool_call {
                 assert_eq!(tool_call.name, "test_tool");
-                assert_eq!(tool_call.arguments, json!({"param": "value"}));
+                assert_eq!(tool_call.arguments, Some(object!({"param": "value"})))
             } else {
                 panic!("Expected successful tool call");
             }
@@ -756,6 +983,7 @@ mod tests {
             image: RawImageContent {
                 data: "base64data".to_string(),
                 mime_type: "image/jpeg".to_string(),
+                meta: None,
             }
             .no_annotation(),
         };
@@ -781,10 +1009,15 @@ mod tests {
             uri: "file:///test.txt".to_string(),
             mime_type: Some("text/plain".to_string()),
             text: "Resource content".to_string(),
+            meta: None,
         };
 
         let prompt_content = PromptMessageContent::Resource {
-            resource: RawEmbeddedResource { resource }.no_annotation(),
+            resource: RawEmbeddedResource {
+                resource,
+                meta: None,
+            }
+            .no_annotation(),
         };
 
         let prompt_message = PromptMessage {
@@ -807,10 +1040,15 @@ mod tests {
             uri: "file:///test.bin".to_string(),
             mime_type: Some("application/octet-stream".to_string()),
             blob: "binary_data".to_string(),
+            meta: None,
         };
 
         let prompt_content = PromptMessageContent::Resource {
-            resource: RawEmbeddedResource { resource }.no_annotation(),
+            resource: RawEmbeddedResource {
+                resource,
+                meta: None,
+            }
+            .no_annotation(),
         };
 
         let prompt_message = PromptMessage {
@@ -864,9 +1102,9 @@ mod tests {
 
     #[test]
     fn test_message_with_tool_request() {
-        let tool_call = Ok(ToolCall {
-            name: "test_tool".to_string(),
-            arguments: serde_json::json!({}),
+        let tool_call = Ok(CallToolRequestParam {
+            name: "test_tool".into(),
+            arguments: Some(object!({})),
         });
 
         let message = Message::assistant().with_tool_request("req1", tool_call);
@@ -897,7 +1135,8 @@ mod tests {
                     "data": "base64data",
                     "mimeType": "image/png"
                 }}
-            ]
+            ],
+            "metadata": {{ "agentVisible": true, "userVisible": true }}
         }}"#,
             malicious_text
         );
@@ -925,11 +1164,142 @@ mod tests {
             "content": [{
                 "type": "text",
                 "text": "Hello world 世界 🌍"
-            }]
+            }],
+            "metadata": { "agentVisible": true, "userVisible": true }
         }"#;
 
         let message: Message = serde_json::from_str(clean_json).unwrap();
 
         assert_eq!(message.as_concat_text(), "Hello world 世界 🌍");
+    }
+
+    #[test]
+    fn test_message_metadata_defaults() {
+        let message = Message::user().with_text("Test");
+
+        // By default, messages should be both user and agent visible
+        assert!(message.is_user_visible());
+        assert!(message.is_agent_visible());
+    }
+
+    #[test]
+    fn test_message_visibility_methods() {
+        // Test user_only
+        let user_only_msg = Message::user().with_text("User only").user_only();
+        assert!(user_only_msg.is_user_visible());
+        assert!(!user_only_msg.is_agent_visible());
+
+        // Test agent_only
+        let agent_only_msg = Message::assistant().with_text("Agent only").agent_only();
+        assert!(!agent_only_msg.is_user_visible());
+        assert!(agent_only_msg.is_agent_visible());
+
+        // Test with_visibility
+        let custom_msg = Message::user()
+            .with_text("Custom visibility")
+            .with_visibility(false, true);
+        assert!(!custom_msg.is_user_visible());
+        assert!(custom_msg.is_agent_visible());
+    }
+
+    #[test]
+    fn test_message_metadata_serialization() {
+        let message = Message::user()
+            .with_text("Test message")
+            .with_visibility(false, true);
+
+        let json_str = serde_json::to_string(&message).unwrap();
+        let value: Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(value["metadata"]["userVisible"], false);
+        assert_eq!(value["metadata"]["agentVisible"], true);
+    }
+
+    #[test]
+    fn test_message_metadata_deserialization() {
+        // Test with explicit metadata
+        let json_with_metadata = r#"{
+            "role": "user",
+            "created": 1640995200,
+            "content": [{
+                "type": "text",
+                "text": "Test"
+            }],
+            "metadata": {
+                "userVisible": false,
+                "agentVisible": true
+            }
+        }"#;
+
+        let message: Message = serde_json::from_str(json_with_metadata).unwrap();
+        assert!(!message.is_user_visible());
+        assert!(message.is_agent_visible());
+    }
+
+    #[test]
+    fn test_message_metadata_static_methods() {
+        // Test MessageMetadata::agent_only()
+        let agent_only_metadata = MessageMetadata::agent_only();
+        assert!(!agent_only_metadata.user_visible);
+        assert!(agent_only_metadata.agent_visible);
+
+        // Test MessageMetadata::user_only()
+        let user_only_metadata = MessageMetadata::user_only();
+        assert!(user_only_metadata.user_visible);
+        assert!(!user_only_metadata.agent_visible);
+
+        // Test MessageMetadata::invisible()
+        let invisible_metadata = MessageMetadata::invisible();
+        assert!(!invisible_metadata.user_visible);
+        assert!(!invisible_metadata.agent_visible);
+
+        // Test using them with messages
+        let agent_msg = Message::assistant()
+            .with_text("Agent only message")
+            .with_metadata(MessageMetadata::agent_only());
+        assert!(!agent_msg.is_user_visible());
+        assert!(agent_msg.is_agent_visible());
+
+        let user_msg = Message::user()
+            .with_text("User only message")
+            .with_metadata(MessageMetadata::user_only());
+        assert!(user_msg.is_user_visible());
+        assert!(!user_msg.is_agent_visible());
+
+        let invisible_msg = Message::user()
+            .with_text("Invisible message")
+            .with_metadata(MessageMetadata::invisible());
+        assert!(!invisible_msg.is_user_visible());
+        assert!(!invisible_msg.is_agent_visible());
+    }
+
+    #[test]
+    fn test_message_metadata_builder_methods() {
+        // Test with_agent_invisible
+        let metadata = MessageMetadata::default().with_agent_invisible();
+        assert!(metadata.user_visible);
+        assert!(!metadata.agent_visible);
+
+        // Test with_user_invisible
+        let metadata = MessageMetadata::default().with_user_invisible();
+        assert!(!metadata.user_visible);
+        assert!(metadata.agent_visible);
+
+        // Test with_agent_visible
+        let metadata = MessageMetadata::invisible().with_agent_visible();
+        assert!(!metadata.user_visible);
+        assert!(metadata.agent_visible);
+
+        // Test with_user_visible
+        let metadata = MessageMetadata::invisible().with_user_visible();
+        assert!(metadata.user_visible);
+        assert!(!metadata.agent_visible);
+
+        // Test chaining
+        let metadata = MessageMetadata::invisible()
+            .with_user_visible()
+            .with_agent_visible();
+        assert!(metadata.user_visible);
+        assert!(metadata.agent_visible);
     }
 }

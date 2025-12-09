@@ -1,14 +1,17 @@
 ---
 title: Auto Visualiser Extension
-description: Add automatic data visualization to Goose
+description: Add automatic data visualization to goose
 ---
 
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
+import YouTubeShortEmbed from '@site/src/components/YouTubeShortEmbed';
 import GooseBuiltinInstaller from '@site/src/components/GooseBuiltinInstaller';
 import ImageCarousel from '@site/src/components/ImageCarousel';
 
-The Auto Visualiser extension enables Goose to automatically generate interactive data visualizations directly in your conversation. This built-in extension leverages MCP-UI to create charts, graphs, maps, and other visual representations of your data without requiring manual requests.
+<YouTubeShortEmbed videoUrl="https://www.youtube.com/embed/txh6DlzPwNo" />
+
+The Auto Visualiser extension enables goose to automatically generate interactive data visualizations directly in your conversation. This built-in extension leverages MCP-UI to create charts, graphs, maps, and other visual representations of your data without requiring manual requests.
 
 This guide will cover enabling and using the Auto Visualiser MCP Server.
 
@@ -16,13 +19,13 @@ This guide will cover enabling and using the Auto Visualiser MCP Server.
 
 
 <Tabs groupId="interface">
-  <TabItem value="ui" label="Goose Desktop" default>
+  <TabItem value="ui" label="goose Desktop" default>
   <GooseBuiltinInstaller
     extensionName="Auto Visualiser"
     description="Automatically generate interactive data visualizations"
   />
   </TabItem>
-  <TabItem value="cli" label="Goose CLI">
+  <TabItem value="cli" label="goose CLI">
 
   1. Run the `configure` command:
   ```sh
@@ -48,7 +51,7 @@ This guide will cover enabling and using the Auto Visualiser MCP Server.
 
 ## Visualization Types
 
-The Auto Visualiser is a powerful extension that integrates with Goose's MCP-UI system to automatically detect when data would benefit from visualization and render interactive visual components. It analyzes data patterns in your conversations and suggests the most appropriate visualization type.
+The Auto Visualiser is a powerful extension that integrates with goose's MCP-UI system to automatically detect when data would benefit from visualization and render interactive visual components. It analyzes data patterns in your conversations and suggests the most appropriate visualization type.
 
 | Chart Type | Description | Detected When Prompt Implies |
 |------------|-------------|------------------------------|
@@ -58,6 +61,7 @@ The Auto Visualiser is a powerful extension that integrates with Goose's MCP-UI 
 | **Treemap Visualizations** | Hierarchical data with proportional area representation | Hierarchical data <br/>(nested categories, organizational structures) |
 | **Chord Diagrams** | Relationship and flow visualization between entities | Relationship matrices <br/>(network connections, cross-references) |
 | **Interactive Maps** | Geographic data visualization with location markers using Leaflet | Geographic information <br/>(location data, coordinates, addresses) |
+| **Mermaid Diagrams** | Flowcharts, sequence diagrams, Gantt charts, and other diagram types using Mermaid syntax | Diagram creation <br/>(flowcharts, sequence diagrams, architecture diagrams) |
 | **Line/Bar/Scatter Charts** | Traditional chart types for data analysis | Time series data <br/>(historical data, trends over time) |
 
 ### Example Visualizations
@@ -74,7 +78,7 @@ The Auto Visualiser is a powerful extension that integrates with Goose's MCP-UI 
 
 ### Features
 
-- **Automatic Detection**: Goose intelligently chooses the best visualization type for your data
+- **Automatic Detection**: goose intelligently chooses the best visualization type for your data
 - **Interactive Components**: All visualizations are interactive with hover effects, zooming, and drilling capabilities
 - **MCP-UI Integration**: Leverages the emerging MCP-UI standard for seamless rendering
 - **Multiple Chart Support**: Can render multiple visualizations in a single response
@@ -84,10 +88,10 @@ The Auto Visualiser is a powerful extension that integrates with Goose's MCP-UI 
 
 ## Example Usage
 
-In this example, I'll have Goose analyze some sales data and automatically visualize it using the Auto Visualiser extension.
+In this example, I'll have goose analyze some sales data and automatically visualize it using the Auto Visualiser extension.
 
 
-### Goose Prompt
+### goose Prompt
 ```
 I have quarterly sales data for different product categories. Can you help me understand:
 1. The hierarchical breakdown of revenue across our nested product categories
@@ -100,7 +104,7 @@ Here's the data:
 - Home & Garden: Q1: $80k, Q2: $95k, Q3: $110k, Q4: $125k
 ```
 
-### Goose Output
+### goose Output
 
 :::note Desktop
 

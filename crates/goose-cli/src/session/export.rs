@@ -1,4 +1,6 @@
-use goose::conversation::message::{Message, MessageContent, ToolRequest, ToolResponse};
+use goose::conversation::message::{
+    ActionRequiredData, Message, MessageContent, ToolRequest, ToolResponse,
+};
 use goose::utils::safe_truncate;
 use rmcp::model::{RawContent, ResourceContents, Role};
 use serde_json::Value;
@@ -127,9 +129,11 @@ pub fn tool_request_to_markdown(req: &ToolRequest, export_all_content: bool) -> 
             ));
             md.push_str("**Arguments:**\n");
 
-            match call.name.as_str() {
+            match call.name.as_ref() {
                 "developer__shell" => {
-                    if let Some(Value::String(command)) = call.arguments.get("command") {
+                    if let Some(Value::String(command)) =
+                        call.arguments.as_ref().and_then(|args| args.get("command"))
+                    {
                         md.push_str(&format!(
                             "*   **command**:\n    ```sh\n    {}\n    ```\n",
                             command.trim()
@@ -137,7 +141,7 @@ pub fn tool_request_to_markdown(req: &ToolRequest, export_all_content: bool) -> 
                     }
                     let other_args: serde_json::Map<String, Value> = call
                         .arguments
-                        .as_object()
+                        .as_ref()
                         .map(|obj| {
                             obj.iter()
                                 .filter(|(k, _)| k.as_str() != "command")
@@ -154,10 +158,16 @@ pub fn tool_request_to_markdown(req: &ToolRequest, export_all_content: bool) -> 
                     }
                 }
                 "developer__text_editor" => {
-                    if let Some(Value::String(path)) = call.arguments.get("path") {
+                    if let Some(Value::String(path)) =
+                        call.arguments.as_ref().and_then(|args| args.get("path"))
+                    {
                         md.push_str(&format!("*   **path**: `{}`\n", path));
                     }
-                    if let Some(Value::String(code_edit)) = call.arguments.get("code_edit") {
+                    if let Some(Value::String(code_edit)) = call
+                        .arguments
+                        .as_ref()
+                        .and_then(|args| args.get("code_edit"))
+                    {
                         md.push_str(&format!(
                             "*   **code_edit**:\n    ```\n{}\n    ```\n",
                             code_edit
@@ -166,7 +176,7 @@ pub fn tool_request_to_markdown(req: &ToolRequest, export_all_content: bool) -> 
 
                     let other_args: serde_json::Map<String, Value> = call
                         .arguments
-                        .as_object()
+                        .as_ref()
                         .map(|obj| {
                             obj.iter()
                                 .filter(|(k, _)| k.as_str() != "path" && k.as_str() != "code_edit")
@@ -183,7 +193,15 @@ pub fn tool_request_to_markdown(req: &ToolRequest, export_all_content: bool) -> 
                     }
                 }
                 _ => {
-                    md.push_str(&value_to_markdown(&call.arguments, 0, export_all_content));
+                    if let Some(args) = &call.arguments {
+                        md.push_str(&value_to_markdown(
+                            &Value::Object(args.clone()),
+                            0,
+                            export_all_content,
+                        ));
+                    } else {
+                        md.push_str("*No arguments*\n");
+                    }
                 }
             }
         }
@@ -256,6 +274,7 @@ pub fn tool_response_to_markdown(resp: &ToolResponse, export_all_content: bool) 
                                 uri,
                                 mime_type,
                                 text,
+                                meta: _,
                             } => {
                                 // Extract file extension from the URI for syntax highlighting
                                 let file_extension = uri.split('.').next_back().unwrap_or("");
@@ -287,6 +306,7 @@ pub fn tool_response_to_markdown(resp: &ToolResponse, export_all_content: bool) 
                                 uri,
                                 mime_type,
                                 blob,
+                                ..
                             } => {
                                 md.push_str(&format!(
                                     "**Binary File:** `{}` (type: {}, {} bytes)\n\n",
@@ -296,6 +316,10 @@ pub fn tool_response_to_markdown(resp: &ToolResponse, export_all_content: bool) 
                                 ));
                             }
                         }
+                    }
+                    RawContent::ResourceLink(_link) => {
+                        // Show a simple placeholder for resource links when exporting
+                        md.push_str("[resource link]\n\n");
                     }
                     RawContent::Audio(_) => {
                         md.push_str("[audio content not displayed in Markdown export]\n\n")
@@ -318,6 +342,28 @@ pub fn message_to_markdown(message: &Message, export_all_content: bool) -> Strin
     let mut md = String::new();
     for content in &message.content {
         match content {
+            MessageContent::ActionRequired(action) => match &action.data {
+                ActionRequiredData::ToolConfirmation { tool_name, .. } => {
+                    md.push_str(&format!(
+                        "**Action Required** (tool_confirmation): {}\n\n",
+                        tool_name
+                    ));
+                }
+                ActionRequiredData::Elicitation { message, .. } => {
+                    md.push_str(&format!(
+                        "**Action Required** (elicitation): {}\n\n",
+                        message
+                    ));
+                }
+                ActionRequiredData::ElicitationResponse { id, user_data } => {
+                    md.push_str(&format!(
+                        "**Action Required** (elicitation_response): {}\n```json\n{}\n```\n\n",
+                        id,
+                        serde_json::to_string_pretty(user_data)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    ));
+                }
+            },
             MessageContent::Text(text) => {
                 md.push_str(&text.text);
                 md.push_str("\n\n");
@@ -347,8 +393,8 @@ pub fn message_to_markdown(message: &Message, export_all_content: bool) -> Strin
                 md.push_str("**Thinking:**\n");
                 md.push_str("> *Thinking was redacted*\n\n");
             }
-            MessageContent::SummarizationRequested(summarization) => {
-                md.push_str(&format!("*{}*\n\n", summarization.msg));
+            MessageContent::SystemNotification(notification) => {
+                md.push_str(&format!("*{}*\n\n", notification.msg));
             }
             _ => {
                 md.push_str(
@@ -364,8 +410,8 @@ pub fn message_to_markdown(message: &Message, export_all_content: bool) -> Strin
 mod tests {
     use super::*;
     use goose::conversation::message::{Message, ToolRequest, ToolResponse};
-    use mcp_core::tool::ToolCall;
-    use rmcp::model::{Content, RawTextContent, TextContent};
+    use rmcp::model::{CallToolRequestParam, Content, RawTextContent, TextContent};
+    use rmcp::object;
     use serde_json::json;
 
     #[test]
@@ -480,16 +526,17 @@ mod tests {
 
     #[test]
     fn test_tool_request_to_markdown_shell() {
-        let tool_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let tool_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "ls -la",
                 "working_dir": "/home/user"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "test-id".to_string(),
             tool_call: Ok(tool_call),
+            thought_signature: None,
         };
 
         let result = tool_request_to_markdown(&tool_request, true);
@@ -503,16 +550,17 @@ mod tests {
 
     #[test]
     fn test_tool_request_to_markdown_text_editor() {
-        let tool_call = ToolCall {
-            name: "developer__text_editor".to_string(),
-            arguments: json!({
+        let tool_call = CallToolRequestParam {
+            name: "developer__text_editor".into(),
+            arguments: Some(object!({
                 "path": "/path/to/file.txt",
                 "code_edit": "print('Hello World')"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "test-id".to_string(),
             tool_call: Ok(tool_call),
+            thought_signature: None,
         };
 
         let result = tool_request_to_markdown(&tool_request, true);
@@ -527,6 +575,7 @@ mod tests {
         let text_content = TextContent {
             raw: RawTextContent {
                 text: "Command executed successfully".to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -546,6 +595,7 @@ mod tests {
         let text_content = TextContent {
             raw: RawTextContent {
                 text: json_text.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -570,9 +620,9 @@ mod tests {
 
     #[test]
     fn test_message_to_markdown_with_tool_request() {
-        let tool_call = ToolCall {
-            name: "test_tool".to_string(),
-            arguments: json!({"param": "value"}),
+        let tool_call = CallToolRequestParam {
+            name: "test_tool".into(),
+            arguments: Some(object!({"param": "value"})),
         };
 
         let message = Message::assistant().with_tool_request("test-id", Ok(tool_call));
@@ -629,15 +679,16 @@ mod tests {
 
     #[test]
     fn test_shell_tool_with_code_output() {
-        let tool_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let tool_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "cat main.py"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "shell-cat".to_string(),
             tool_call: Ok(tool_call),
+            thought_signature: None,
         };
 
         let python_code = r#"#!/usr/bin/env python3
@@ -650,6 +701,7 @@ if __name__ == "__main__":
         let text_content = TextContent {
             raw: RawTextContent {
                 text: python_code.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -674,21 +726,23 @@ if __name__ == "__main__":
 
     #[test]
     fn test_shell_tool_with_git_commands() {
-        let git_status_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let git_status_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "git status --porcelain"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "git-status".to_string(),
             tool_call: Ok(git_status_call),
+            thought_signature: None,
         };
 
         let git_output = " M src/main.rs\n?? temp.txt\n A new_feature.rs";
         let text_content = TextContent {
             raw: RawTextContent {
                 text: git_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -711,15 +765,16 @@ if __name__ == "__main__":
 
     #[test]
     fn test_shell_tool_with_build_output() {
-        let cargo_build_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let cargo_build_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "cargo build"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "cargo-build".to_string(),
             tool_call: Ok(cargo_build_call),
+            thought_signature: None,
         };
 
         let build_output = r#"   Compiling goose-cli v0.1.0 (/Users/user/goose)
@@ -736,6 +791,7 @@ warning: unused variable `x`
         let text_content = TextContent {
             raw: RawTextContent {
                 text: build_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -754,15 +810,16 @@ warning: unused variable `x`
 
     #[test]
     fn test_shell_tool_with_json_api_response() {
-        let curl_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let curl_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "curl -s https://api.github.com/repos/microsoft/vscode/releases/latest"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "curl-api".to_string(),
             tool_call: Ok(curl_call),
+            thought_signature: None,
         };
 
         let api_response = r#"{
@@ -781,6 +838,7 @@ warning: unused variable `x`
         let text_content = TextContent {
             raw: RawTextContent {
                 text: api_response.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -799,22 +857,24 @@ warning: unused variable `x`
 
     #[test]
     fn test_text_editor_tool_with_code_creation() {
-        let editor_call = ToolCall {
-            name: "developer__text_editor".to_string(),
-            arguments: json!({
+        let editor_call = CallToolRequestParam {
+            name: "developer__text_editor".into(),
+            arguments: Some(object!({
                 "command": "write",
                 "path": "/tmp/fibonacci.js",
                 "file_text": "function fibonacci(n) {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}\n\nconsole.log(fibonacci(10));"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "editor-write".to_string(),
             tool_call: Ok(editor_call),
+            thought_signature: None,
         };
 
         let text_content = TextContent {
             raw: RawTextContent {
                 text: "File created successfully".to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -839,16 +899,17 @@ warning: unused variable `x`
 
     #[test]
     fn test_text_editor_tool_view_code() {
-        let editor_call = ToolCall {
-            name: "developer__text_editor".to_string(),
-            arguments: json!({
+        let editor_call = CallToolRequestParam {
+            name: "developer__text_editor".into(),
+            arguments: Some(object!({
                 "command": "view",
                 "path": "/src/utils.py"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "editor-view".to_string(),
             tool_call: Ok(editor_call),
+            thought_signature: None,
         };
 
         let python_code = r#"import os
@@ -870,6 +931,7 @@ def process_data(data: List[Dict]) -> List[Dict]:
         let text_content = TextContent {
             raw: RawTextContent {
                 text: python_code.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -888,15 +950,16 @@ def process_data(data: List[Dict]) -> List[Dict]:
 
     #[test]
     fn test_shell_tool_with_error_output() {
-        let error_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let error_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "python nonexistent_script.py"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "shell-error".to_string(),
             tool_call: Ok(error_call),
+            thought_signature: None,
         };
 
         let error_output = r#"python: can't open file 'nonexistent_script.py': [Errno 2] No such file or directory
@@ -905,6 +968,7 @@ Command failed with exit code 2"#;
         let text_content = TextContent {
             raw: RawTextContent {
                 text: error_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -922,15 +986,16 @@ Command failed with exit code 2"#;
 
     #[test]
     fn test_shell_tool_complex_script_execution() {
-        let script_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let script_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "python -c \"import sys; print(f'Python {sys.version}'); [print(f'{i}^2 = {i**2}') for i in range(1, 6)]\""
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "script-exec".to_string(),
             tool_call: Ok(script_call),
+            thought_signature: None,
         };
 
         let script_output = r#"Python 3.11.5 (main, Aug 24 2023, 15:18:16) [Clang 14.0.3 ]
@@ -943,6 +1008,7 @@ Command failed with exit code 2"#;
         let text_content = TextContent {
             raw: RawTextContent {
                 text: script_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -967,15 +1033,16 @@ Command failed with exit code 2"#;
 
     #[test]
     fn test_shell_tool_with_multi_command() {
-        let multi_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let multi_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "cd /tmp && ls -la | head -5 && pwd"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "multi-cmd".to_string(),
             tool_call: Ok(multi_call),
+            thought_signature: None,
         };
 
         let multi_output = r#"total 24
@@ -988,6 +1055,7 @@ drwx------   3 user  staff    96 Dec  6 16:20 com.apple.launchd.abc
         let text_content = TextContent {
             raw: RawTextContent {
                 text: multi_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -1010,15 +1078,16 @@ drwx------   3 user  staff    96 Dec  6 16:20 com.apple.launchd.abc
 
     #[test]
     fn test_developer_tool_grep_code_search() {
-        let grep_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let grep_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "rg 'async fn' --type rust -n"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "grep-search".to_string(),
             tool_call: Ok(grep_call),
+            thought_signature: None,
         };
 
         let grep_output = r#"src/main.rs:15:async fn process_request(req: Request) -> Result<Response> {
@@ -1029,6 +1098,7 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
         let text_content = TextContent {
             raw: RawTextContent {
                 text: grep_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -1052,21 +1122,23 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
     #[test]
     fn test_shell_tool_json_detection_works() {
         // This test shows that JSON detection in tool responses DOES work
-        let tool_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let tool_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "echo '{\"test\": \"json\"}'"
-            }),
+            })),
         };
         let _tool_request = ToolRequest {
             id: "json-test".to_string(),
             tool_call: Ok(tool_call),
+            thought_signature: None,
         };
 
         let json_output = r#"{"status": "success", "data": {"count": 42}}"#;
         let text_content = TextContent {
             raw: RawTextContent {
                 text: json_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };
@@ -1085,15 +1157,16 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
 
     #[test]
     fn test_shell_tool_with_package_management() {
-        let npm_call = ToolCall {
-            name: "developer__shell".to_string(),
-            arguments: json!({
+        let npm_call = CallToolRequestParam {
+            name: "developer__shell".into(),
+            arguments: Some(object!({
                 "command": "npm install express typescript @types/node --save-dev"
-            }),
+            })),
         };
         let tool_request = ToolRequest {
             id: "npm-install".to_string(),
             tool_call: Ok(npm_call),
+            thought_signature: None,
         };
 
         let npm_output = r#"added 57 packages, and audited 58 packages in 3s
@@ -1106,6 +1179,7 @@ found 0 vulnerabilities"#;
         let text_content = TextContent {
             raw: RawTextContent {
                 text: npm_output.to_string(),
+                meta: None,
             },
             annotations: None,
         };

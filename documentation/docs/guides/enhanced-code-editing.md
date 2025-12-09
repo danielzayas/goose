@@ -2,6 +2,7 @@
 title: Enhanced Code Editing with AI Models
 sidebar_label: Enhanced Code Editing
 description: Use AI models to intelligently apply code changes
+sidebar_position: 110
 ---
 
 The [Developer extension](/docs/mcp/developer-mcp) supports using AI models for enhanced code editing through the `str_replace` command. When configured, it intelligently applies code changes using an AI model instead of simple string replacement.
@@ -71,9 +72,9 @@ export GOOSE_EDITOR_MODEL="your-model"
 
 When the `str_replace` tool is used to edit code:
 
-1. **Configuration Check**: Goose checks if all three environment variables are properly set and non-empty.
+1. **Configuration Check**: goose checks if all three environment variables are properly set and non-empty.
 
-2. **With AI Enabled**: If configured, Goose sends the original code and your requested change to the configured AI model for processing.
+2. **With AI Enabled**: If configured, goose sends the original code and your requested change to the configured AI model for processing.
 
 3. **Fallback**: If the AI API is not configured or the API call fails, it falls back to simple string replacement.
 

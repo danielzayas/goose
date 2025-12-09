@@ -1,11 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  activateExtension,
-  addToAgentOnStartup,
-  updateExtension,
-  toggleExtension,
-  deleteExtension,
-} from './extension-manager';
+import { addToAgentOnStartup, updateExtension, toggleExtension } from './extension-manager';
 import * as agentApi from './agent-api';
 import * as toasts from '../../../toasts';
 
@@ -25,6 +19,7 @@ describe('Extension Manager', () => {
   const mockExtensionConfig = {
     type: 'stdio' as const,
     name: 'test-extension',
+    description: 'test-extension',
     cmd: 'python',
     args: ['script.py'],
     timeout: 300,
@@ -37,76 +32,27 @@ describe('Extension Manager', () => {
     mockRemoveFromConfig.mockResolvedValue(undefined);
   });
 
-  describe('activateExtension', () => {
-    it('should successfully activate extension', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
-
-      await activateExtension({
-        addToConfig: mockAddToConfig,
-        extensionConfig: mockExtensionConfig,
-      });
-
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, { silent: false });
-      expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, true);
-    });
-
-    it('should add to config as disabled if agent fails', async () => {
-      const agentError = new Error('Agent failed');
-      mockAddToAgent.mockRejectedValue(agentError);
-
-      await expect(
-        activateExtension({
-          addToConfig: mockAddToConfig,
-          extensionConfig: mockExtensionConfig,
-        })
-      ).rejects.toThrow('Agent failed');
-
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, { silent: false });
-      expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, false);
-    });
-
-    it('should remove from agent if config fails', async () => {
-      const configError = new Error('Config failed');
-      mockAddToAgent.mockResolvedValue({} as Response);
-      mockAddToConfig.mockRejectedValue(configError);
-
-      await expect(
-        activateExtension({
-          addToConfig: mockAddToConfig,
-          extensionConfig: mockExtensionConfig,
-        })
-      ).rejects.toThrow('Config failed');
-
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, { silent: false });
-      expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, true);
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension');
-    });
-  });
-
   describe('addToAgentOnStartup', () => {
     it('should successfully add extension on startup', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
 
       await addToAgentOnStartup({
-        addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         extensionConfig: mockExtensionConfig,
       });
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, { silent: true });
-      expect(mockAddToConfig).not.toHaveBeenCalled();
+      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, 'test-session', true);
     });
 
     it('should successfully add extension on startup with custom toast options', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
 
       await addToAgentOnStartup({
-        addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         extensionConfig: mockExtensionConfig,
-        toastOptions: { silent: false },
       });
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, { silent: false });
-      expect(mockAddToConfig).not.toHaveBeenCalled();
+      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, 'test-session', true);
     });
 
     it('should retry on 428 errors', async () => {
@@ -114,54 +60,46 @@ describe('Extension Manager', () => {
       mockAddToAgent
         .mockRejectedValueOnce(error428)
         .mockRejectedValueOnce(error428)
-        .mockResolvedValue({} as Response);
+        .mockResolvedValue(undefined);
 
       await addToAgentOnStartup({
-        addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         extensionConfig: mockExtensionConfig,
       });
 
       expect(mockAddToAgent).toHaveBeenCalledTimes(3);
     });
 
-    it('should disable extension after max retries', async () => {
+    it('should throw error after max retries', async () => {
       const error428 = new Error('428 Precondition Required');
       mockAddToAgent.mockRejectedValue(error428);
-      mockToastService.configure = vi.fn();
-      mockToastService.error = vi.fn();
 
-      await addToAgentOnStartup({
-        addToConfig: mockAddToConfig,
-        extensionConfig: mockExtensionConfig,
-      });
+      await expect(
+        addToAgentOnStartup({
+          sessionId: 'test-session',
+          extensionConfig: mockExtensionConfig,
+        })
+      ).rejects.toThrow('428 Precondition Required');
 
       expect(mockAddToAgent).toHaveBeenCalledTimes(4); // Initial + 3 retries
-      expect(mockToastService.error).toHaveBeenCalledWith({
-        title: 'test-extension',
-        msg: 'Extension failed to start and will be disabled.',
-        traceback: '428 Precondition Required',
-      });
     });
   });
 
   describe('updateExtension', () => {
     it('should update extension without name change', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
       mockAddToConfig.mockResolvedValue(undefined);
       mockToastService.success = vi.fn();
 
       await updateExtension({
         enabled: true,
         addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         removeFromConfig: mockRemoveFromConfig,
         extensionConfig: mockExtensionConfig,
         originalName: 'test-extension',
       });
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(
-        { ...mockExtensionConfig, name: 'test-extension' },
-        { silent: true }
-      );
       expect(mockAddToConfig).toHaveBeenCalledWith(
         'test-extension',
         { ...mockExtensionConfig, name: 'test-extension' },
@@ -174,8 +112,8 @@ describe('Extension Manager', () => {
     });
 
     it('should handle name change by removing old and adding new', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
-      mockRemoveFromAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
+      mockRemoveFromAgent.mockResolvedValue(undefined);
       mockRemoveFromConfig.mockResolvedValue(undefined);
       mockAddToConfig.mockResolvedValue(undefined);
       mockToastService.success = vi.fn();
@@ -183,16 +121,17 @@ describe('Extension Manager', () => {
       await updateExtension({
         enabled: true,
         addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         removeFromConfig: mockRemoveFromConfig,
         extensionConfig: { ...mockExtensionConfig, name: 'new-extension' },
         originalName: 'old-extension',
       });
 
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('old-extension', { silent: true });
       expect(mockRemoveFromConfig).toHaveBeenCalledWith('old-extension');
       expect(mockAddToAgent).toHaveBeenCalledWith(
         { ...mockExtensionConfig, name: 'new-extension' },
-        { silent: true }
+        'test-session',
+        false
       );
       expect(mockAddToConfig).toHaveBeenCalledWith(
         'new-extension',
@@ -208,6 +147,7 @@ describe('Extension Manager', () => {
       await updateExtension({
         enabled: false,
         addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
         removeFromConfig: mockRemoveFromConfig,
         extensionConfig: mockExtensionConfig,
         originalName: 'test-extension',
@@ -228,30 +168,32 @@ describe('Extension Manager', () => {
 
   describe('toggleExtension', () => {
     it('should toggle extension on successfully', async () => {
-      mockAddToAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
       mockAddToConfig.mockResolvedValue(undefined);
 
       await toggleExtension({
         toggle: 'toggleOn',
         extensionConfig: mockExtensionConfig,
         addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
       });
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, {});
+      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, 'test-session', true);
       expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, true);
     });
 
     it('should toggle extension off successfully', async () => {
-      mockRemoveFromAgent.mockResolvedValue({} as Response);
+      mockRemoveFromAgent.mockResolvedValue(undefined);
       mockAddToConfig.mockResolvedValue(undefined);
 
       await toggleExtension({
         toggle: 'toggleOff',
         extensionConfig: mockExtensionConfig,
         addToConfig: mockAddToConfig,
+        sessionId: 'test-session',
       });
 
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', {});
+      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', 'test-session', true);
       expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, false);
     });
 
@@ -265,17 +207,18 @@ describe('Extension Manager', () => {
           toggle: 'toggleOn',
           extensionConfig: mockExtensionConfig,
           addToConfig: mockAddToConfig,
+          sessionId: 'test-session',
         })
       ).rejects.toThrow('Agent failed');
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, {});
+      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, 'test-session', true);
       // addToConfig is called during the rollback (toggleOff)
       expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, false);
     });
 
     it('should remove from agent if config update fails when toggling on', async () => {
       const configError = new Error('Config failed');
-      mockAddToAgent.mockResolvedValue({} as Response);
+      mockAddToAgent.mockResolvedValue(undefined);
       mockAddToConfig.mockRejectedValue(configError);
 
       await expect(
@@ -283,12 +226,13 @@ describe('Extension Manager', () => {
           toggle: 'toggleOn',
           extensionConfig: mockExtensionConfig,
           addToConfig: mockAddToConfig,
+          sessionId: 'test-session',
         })
       ).rejects.toThrow('Config failed');
 
-      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, {});
+      expect(mockAddToAgent).toHaveBeenCalledWith(mockExtensionConfig, 'test-session', true);
       expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, true);
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', {});
+      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', 'test-session', true);
     });
 
     it('should update config even if agent removal fails when toggling off', async () => {
@@ -301,59 +245,11 @@ describe('Extension Manager', () => {
           toggle: 'toggleOff',
           extensionConfig: mockExtensionConfig,
           addToConfig: mockAddToConfig,
+          sessionId: 'test-session',
         })
       ).rejects.toThrow('Agent removal failed');
 
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', {});
       expect(mockAddToConfig).toHaveBeenCalledWith('test-extension', mockExtensionConfig, false);
-    });
-  });
-
-  describe('deleteExtension', () => {
-    it('should delete extension successfully', async () => {
-      mockRemoveFromAgent.mockResolvedValue({} as Response);
-      mockRemoveFromConfig.mockResolvedValue(undefined);
-
-      await deleteExtension({
-        name: 'test-extension',
-        removeFromConfig: mockRemoveFromConfig,
-      });
-
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', { isDelete: true });
-      expect(mockRemoveFromConfig).toHaveBeenCalledWith('test-extension');
-    });
-
-    it('should remove from config even if agent removal fails', async () => {
-      const agentError = new Error('Agent removal failed');
-      mockRemoveFromAgent.mockRejectedValue(agentError);
-      mockRemoveFromConfig.mockResolvedValue(undefined);
-
-      await expect(
-        deleteExtension({
-          name: 'test-extension',
-          removeFromConfig: mockRemoveFromConfig,
-        })
-      ).rejects.toThrow('Agent removal failed');
-
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', { isDelete: true });
-      expect(mockRemoveFromConfig).toHaveBeenCalledWith('test-extension');
-    });
-
-    it('should throw config error if both agent and config fail', async () => {
-      const agentError = new Error('Agent removal failed');
-      const configError = new Error('Config removal failed');
-      mockRemoveFromAgent.mockRejectedValue(agentError);
-      mockRemoveFromConfig.mockRejectedValue(configError);
-
-      await expect(
-        deleteExtension({
-          name: 'test-extension',
-          removeFromConfig: mockRemoveFromConfig,
-        })
-      ).rejects.toThrow('Config removal failed');
-
-      expect(mockRemoveFromAgent).toHaveBeenCalledWith('test-extension', { isDelete: true });
-      expect(mockRemoveFromConfig).toHaveBeenCalledWith('test-extension');
     });
   });
 });
